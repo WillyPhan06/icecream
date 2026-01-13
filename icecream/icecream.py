@@ -154,6 +154,7 @@ DEFAULT_LINE_WRAP_WIDTH = 70  # Characters.
 DEFAULT_CONTEXT_DELIMITER = '- '
 DEFAULT_OUTPUT_FUNCTION = colorizedStderrPrint
 DEFAULT_ARG_TO_STRING_FUNCTION = safe_pformat
+DEFAULT_INDENTATION_STR = '    '  # 4 spaces per level.
 
 """
 This info message is printed instead of the arguments when icecream
@@ -178,6 +179,21 @@ NO_SOURCE_AVAILABLE_WARNING_MESSAGE = (
 
 def callOrValue(obj: object) -> object:
     return obj() if callable(obj) else obj
+
+
+def _getCallStackDepth() -> int:
+    """Get the current call stack depth.
+
+    Returns the number of frames in the call stack, excluding this function itself.
+    """
+    depth = 0
+    frame = inspect.currentframe()
+    if frame is not None:
+        frame = frame.f_back  # Skip this function
+    while frame is not None:
+        depth += 1
+        frame = frame.f_back
+    return depth
 
 
 class Source(executing.Source):
@@ -273,20 +289,38 @@ class IceCreamDebugger:
     def __init__(self, prefix: Union[str, Callable[[], str]] =DEFAULT_PREFIX,
                  outputFunction: Callable[[str], None]=DEFAULT_OUTPUT_FUNCTION,
                  argToStringFunction: Union[_SingleDispatchCallable, Callable[[Any], str]]=argumentToString, includeContext: bool=False,
-                 contextAbsPath: bool=False):
+                 contextAbsPath: bool=False, enableIndentation: bool=False,
+                 indentationStr: str=DEFAULT_INDENTATION_STR):
         self.enabled = True
         self.prefix = prefix
         self.includeContext = includeContext
         self.outputFunction = outputFunction
         self.argToStringFunction = argToStringFunction
         self.contextAbsPath = contextAbsPath
+        self.enableIndentation = enableIndentation
+        self.indentationStr = indentationStr
+        self._baseStackDepth: Optional[int] = None
 
     def __call__(self, *args: object) -> object:
         if self.enabled:
             currentFrame = inspect.currentframe()
             assert currentFrame is not None and currentFrame.f_back is not None
             callFrame = currentFrame.f_back
-            self.outputFunction(self._format(callFrame, *args))
+
+            # Calculate indentation level based on call stack depth
+            indentLevel = 0
+            if self.enableIndentation:
+                # +2 accounts for __call__ and _getCallStackDepth frames
+                currentDepth = _getCallStackDepth() + 2
+                if self._baseStackDepth is None:
+                    self._baseStackDepth = currentDepth
+                indentLevel = max(0, currentDepth - self._baseStackDepth)
+
+            out = self._format(callFrame, *args)
+            if indentLevel > 0:
+                indent = self.indentationStr * indentLevel
+                out = '\n'.join(indent + line for line in out.splitlines())
+            self.outputFunction(out)
 
         if not args:  # E.g. ic().
             passthrough = None
@@ -433,6 +467,15 @@ class IceCreamDebugger:
     def use_stderr(self) -> None:
         self.outputFunction = colorizedStderrPrint
 
+    def resetIndentation(self) -> None:
+        """Reset the base stack depth for indentation.
+
+        Call this method when you want the next ic() call to be treated
+        as the new baseline (zero indentation level). This is useful when
+        starting a new debugging session or when the call context has changed.
+        """
+        self._baseStackDepth = None
+
     def configureOutput(
         self: "IceCreamDebugger",
         prefix: Union[str, Literal[Sentinel.absent]] = Sentinel.absent,
@@ -440,8 +483,59 @@ class IceCreamDebugger:
         argToStringFunction: Union[Callable, Literal[Sentinel.absent]] = Sentinel.absent,
         includeContext: Union[bool, Literal[Sentinel.absent]] = Sentinel.absent,
         contextAbsPath: Union[bool, Literal[Sentinel.absent]] = Sentinel.absent,
-        lineWrapWidth: Union[bool, Literal[Sentinel.absent]] = Sentinel.absent
+        lineWrapWidth: Union[bool, Literal[Sentinel.absent]] = Sentinel.absent,
+        enableIndentation: Union[bool, Literal[Sentinel.absent]] = Sentinel.absent,
+        indentationStr: Union[str, Literal[Sentinel.absent]] = Sentinel.absent
     ) -> None:
+        """Configure ic() output settings.
+
+        Args:
+            prefix: String or callable that returns a string to prefix output.
+                Default is 'ic| '.
+            outputFunction: Function to handle output. Receives the formatted
+                string as argument. Default prints to stderr with syntax highlighting.
+            argToStringFunction: Function to convert argument values to strings.
+                Default uses pprint.pformat().
+            includeContext: If True, include filename, line number, and function
+                name in output. Default is False.
+            contextAbsPath: If True, use absolute paths in context. Only applies
+                when includeContext is True. Default is False.
+            lineWrapWidth: Maximum line width before wrapping. Default is 70.
+            enableIndentation: If True, ic() output is indented based on call
+                stack depth relative to the first ic() call. This helps visualize
+                nested and recursive function calls. The first ic() call establishes
+                the baseline (zero indentation), and subsequent calls from deeper
+                in the call stack are indented proportionally. Toggling this setting
+                on/off preserves the baseline; use resetIndentation() to reset it.
+                Default is False.
+            indentationStr: String used for each level of indentation when
+                enableIndentation is True. Default is 4 spaces ('    ').
+
+        Raises:
+            TypeError: If no arguments are provided.
+
+        Example:
+            # Enable indentation for nested calls
+            ic.configureOutput(enableIndentation=True)
+
+            def inner():
+                ic("inner")  # Indented output
+
+            def outer():
+                ic("outer")  # Baseline (no indentation)
+                inner()
+
+            outer()
+            # Output:
+            # ic| 'outer'
+            #     ic| 'inner'
+
+            # Custom indentation string
+            ic.configureOutput(indentationStr='>> ')
+
+            # Reset baseline for new debugging session
+            ic.resetIndentation()
+        """
         noParameterProvided = all(
             v is Sentinel.absent for k, v in locals().items() if k != 'self')
         if noParameterProvided:
@@ -464,6 +558,12 @@ class IceCreamDebugger:
 
         if lineWrapWidth is not Sentinel.absent:
             self.lineWrapWidth = lineWrapWidth
+
+        if enableIndentation is not Sentinel.absent:
+            self.enableIndentation = enableIndentation
+
+        if indentationStr is not Sentinel.absent:
+            self.indentationStr = indentationStr
 
 
 ic = IceCreamDebugger()

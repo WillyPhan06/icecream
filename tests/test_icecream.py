@@ -695,5 +695,277 @@ ic| (a,
 
         s = err.getvalue()
         self.assertIn("ic|", s)
-        # Don’t assert exact text; just ensure something printed.
+        # Don't assert exact text; just ensure something printed.
         self.assertTrue(len(s) > 0)
+
+
+class TestIndentation(unittest.TestCase):
+    """Tests for the indentation feature for nested/recursive calls."""
+
+    def setUp(self):
+        ic._pairDelimiter = TEST_PAIR_DELIMITER
+        # Ensure indentation is disabled by default
+        ic.configureOutput(enableIndentation=False)
+        ic.resetIndentation()
+
+    def tearDown(self):
+        # Reset to default state
+        ic.configureOutput(enableIndentation=False)
+        ic.resetIndentation()
+
+    def test_indentation_disabled_by_default(self):
+        """Indentation should be disabled by default."""
+        self.assertFalse(ic.enableIndentation)
+
+    def test_indentation_can_be_enabled(self):
+        """Indentation can be enabled via configureOutput."""
+        ic.configureOutput(enableIndentation=True)
+        self.assertTrue(ic.enableIndentation)
+
+    def test_no_indentation_when_disabled(self):
+        """When indentation is disabled, all output should be left-aligned."""
+        ic.configureOutput(enableIndentation=False)
+
+        def inner():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(a)
+            return err.getvalue()
+
+        def outer():
+            return inner()
+
+        result = outer()
+        # Should start with ic| (no indentation)
+        self.assertTrue(result.strip().startswith('ic|'))
+
+    def test_indentation_with_nested_calls(self):
+        """When indentation is enabled, nested calls should be indented."""
+        ic.configureOutput(enableIndentation=True)
+        ic.resetIndentation()
+
+        results = []
+
+        def level2():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(c)
+            results.append(err.getvalue())
+
+        def level1():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(b)
+            results.append(err.getvalue())
+            level2()
+
+        def level0():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(a)
+            results.append(err.getvalue())
+            level1()
+
+        level0()
+
+        # level0 should have no indentation (baseline)
+        self.assertTrue(results[0].strip().startswith('ic|'))
+        self.assertFalse(results[0].startswith('    '))
+
+        # level1 should have 1 level of indentation
+        self.assertTrue(results[1].startswith('    '))
+        self.assertIn('ic|', results[1])
+
+        # level2 should have 2 levels of indentation
+        self.assertTrue(results[2].startswith('        '))
+        self.assertIn('ic|', results[2])
+
+    def test_recursive_function_indentation(self):
+        """Recursive function calls should show increasing indentation."""
+        ic.configureOutput(enableIndentation=True)
+        ic.resetIndentation()
+
+        results = []
+
+        def recursive(n):
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(n)
+            results.append(err.getvalue())
+            if n > 0:
+                recursive(n - 1)
+
+        recursive(2)
+
+        # First call (n=2) should be baseline (no indentation)
+        self.assertTrue(results[0].strip().startswith('ic|'))
+
+        # Each subsequent call should have more indentation
+        for i in range(1, len(results)):
+            expected_indent = '    ' * i
+            self.assertTrue(results[i].startswith(expected_indent),
+                           f"Result {i} should start with {len(expected_indent)} spaces")
+
+    def test_custom_indentation_string(self):
+        """Custom indentation string can be configured."""
+        ic.configureOutput(enableIndentation=True, indentationStr='--')
+        ic.resetIndentation()
+
+        results = []
+
+        def inner():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(b)
+            results.append(err.getvalue())
+
+        def outer():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(a)
+            results.append(err.getvalue())
+            inner()
+
+        outer()
+
+        # Outer should have no indentation
+        self.assertFalse(results[0].startswith('--'))
+
+        # Inner should have '--' indentation
+        self.assertTrue(results[1].startswith('--'))
+        self.assertFalse(results[1].startswith('----'))
+
+    def test_reset_indentation(self):
+        """resetIndentation() should reset the baseline."""
+        ic.configureOutput(enableIndentation=True)
+
+        results = []
+
+        def inner():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(b)
+            results.append(err.getvalue())
+
+        def outer():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(a)
+            results.append(err.getvalue())
+            inner()
+
+        # First call sequence
+        ic.resetIndentation()
+        outer()
+
+        # Reset and call again - should start fresh
+        ic.resetIndentation()
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(c)
+        results.append(err.getvalue())
+
+        # The last call after reset should have no indentation
+        self.assertTrue(results[-1].strip().startswith('ic|'))
+        self.assertFalse(results[-1].startswith('    '))
+
+    def test_multiline_output_indentation(self):
+        """Multiline output should have all lines indented."""
+        ic.configureOutput(enableIndentation=True)
+        ic.resetIndentation()
+
+        multilineStr = 'line1\nline2'
+
+        def inner():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(multilineStr)
+            return err.getvalue()
+
+        def outer():
+            return inner()
+
+        result = outer()
+        lines = result.splitlines()
+
+        # All lines should be indented
+        for line in lines:
+            self.assertTrue(line.startswith('    '),
+                           f"Line '{line}' should be indented")
+
+    def test_indentation_with_include_context(self):
+        """Indentation should work with includeContext enabled."""
+        ic.configureOutput(enableIndentation=True, includeContext=True)
+        ic.resetIndentation()
+
+        results = []
+
+        def inner():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(b)
+            results.append(err.getvalue())
+
+        def outer():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(a)
+            results.append(err.getvalue())
+            inner()
+
+        outer()
+
+        # Reset includeContext
+        ic.configureOutput(includeContext=False)
+
+        # Outer should have no indentation but include context
+        self.assertTrue(results[0].strip().startswith('ic|'))
+        self.assertIn('in outer()', results[0])
+
+        # Inner should be indented and include context
+        self.assertTrue(results[1].startswith('    '))
+        self.assertIn('in inner()', results[1])
+
+    def test_disable_enable_preserves_baseline(self):
+        """Disabling and re-enabling indentation should preserve the baseline."""
+        ic.configureOutput(enableIndentation=True)
+        ic.resetIndentation()
+
+        results = []
+
+        def level2():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(c)
+            results.append(err.getvalue())
+
+        def level1():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(b)
+            results.append(err.getvalue())
+            level2()
+
+        def level0():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(a)
+            results.append(err.getvalue())
+            level1()
+
+        # Call level0 to establish baseline and capture indented output
+        level0()
+
+        # results[0] = level0 (baseline, no indent)
+        # results[1] = level1 (1 level indent)
+        # results[2] = level2 (2 levels indent)
+        self.assertFalse(results[0].startswith('    '))
+        self.assertTrue(results[1].startswith('    '))
+        self.assertTrue(results[2].startswith('        '))
+
+        # Now disable indentation
+        ic.configureOutput(enableIndentation=False)
+
+        # Call at same levels - should have no indentation when disabled
+        results.clear()
+        level0()
+        self.assertFalse(results[0].startswith('    '))
+        self.assertFalse(results[1].startswith('    '))
+        self.assertFalse(results[2].startswith('    '))
+
+        # Re-enable indentation - baseline should be preserved
+        ic.configureOutput(enableIndentation=True)
+
+        # Call at same levels - should have same indentation as before
+        results.clear()
+        level0()
+
+        # Baseline was set at level0's stack depth, so:
+        # level0 = no indent, level1 = 1 indent, level2 = 2 indents
+        self.assertFalse(results[0].startswith('    '))
+        self.assertTrue(results[1].startswith('    '))
+        self.assertTrue(results[2].startswith('        '))
