@@ -20,6 +20,7 @@ from os.path import basename, splitext, realpath
 
 import icecream
 from icecream import ic, argumentToString, stderrPrint, NO_SOURCE_AVAILABLE_WARNING_MESSAGE
+from icecream.icecream import is_sensitive_key, _mask_sensitive_value
 
 TEST_PAIR_DELIMITER = '| '
 MY_FILENAME = basename(__file__)
@@ -969,3 +970,312 @@ class TestIndentation(unittest.TestCase):
         self.assertFalse(results[0].startswith('    '))
         self.assertTrue(results[1].startswith('    '))
         self.assertTrue(results[2].startswith('        '))
+
+
+class TestSensitiveDataMasking(unittest.TestCase):
+    """Tests for sensitive data masking feature."""
+
+    def setUp(self):
+        ic._pairDelimiter = TEST_PAIR_DELIMITER
+        # Clear any sensitive keys from previous tests
+        ic.configureSensitiveKeys(clear=True)
+
+    def tearDown(self):
+        # Reset sensitive keys after each test
+        ic.configureSensitiveKeys(clear=True)
+
+    def test_no_masking_by_default(self):
+        """By default, no masking should occur."""
+        password = 'secret123'
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(password)
+        self.assertIn('secret123', err.getvalue())
+
+    def test_configure_sensitive_keys_requires_argument(self):
+        """configureSensitiveKeys() should raise TypeError if no arguments."""
+        with self.assertRaises(TypeError):
+            ic.configureSensitiveKeys()
+
+    def test_mask_simple_variable_by_name(self):
+        """Variables with sensitive names should be masked."""
+        ic.configureSensitiveKeys(keys=['password'])
+        password = 'secret123'
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(password)
+        output = err.getvalue()
+        self.assertNotIn('secret123', output)
+        self.assertIn('***MASKED***', output)
+
+    def test_mask_dict_values(self):
+        """Dictionary values with sensitive keys should be masked."""
+        ic.configureSensitiveKeys(keys=['password', 'api_key'])
+        config = {'password': 'secret123', 'api_key': 'sk-abc123', 'debug': True}
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(config)
+        output = err.getvalue()
+        self.assertNotIn('secret123', output)
+        self.assertNotIn('sk-abc123', output)
+        self.assertIn('***MASKED***', output)
+        self.assertIn('True', output)  # Non-sensitive value should be visible
+
+    def test_mask_nested_dict_values(self):
+        """Nested dictionary values with sensitive keys should be masked."""
+        ic.configureSensitiveKeys(keys=['password'])
+        config = {'database': {'password': 'dbpass123', 'host': 'localhost'}}
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(config)
+        output = err.getvalue()
+        self.assertNotIn('dbpass123', output)
+        self.assertIn('***MASKED***', output)
+        self.assertIn('localhost', output)
+
+    def test_case_insensitive_matching(self):
+        """Key matching should be case-insensitive."""
+        ic.configureSensitiveKeys(keys=['password'])
+        data = {'PASSWORD': 'upper', 'Password': 'mixed', 'password': 'lower'}
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(data)
+        output = err.getvalue()
+        self.assertNotIn('upper', output)
+        self.assertNotIn('mixed', output)
+        self.assertNotIn('lower', output)
+
+    def test_substring_matching(self):
+        """Key matching should use substring matching."""
+        ic.configureSensitiveKeys(keys=['password'])
+        data = {'user_password': 'pass1', 'passwordHash': 'pass2'}
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(data)
+        output = err.getvalue()
+        self.assertNotIn('pass1', output)
+        self.assertNotIn('pass2', output)
+
+    def test_mask_string_patterns(self):
+        """Strings containing sensitive patterns should be masked.
+
+        The string masking uses regex to find key-value patterns in the format:
+            <sensitive_key><separator><value>
+
+        Where:
+            - <sensitive_key>: case-insensitive match of configured sensitive keys
+            - <separator>: '=' or ':' with optional whitespace around it
+            - <value>: characters until a delimiter (whitespace, comma, semicolon,
+                       quotes, braces, brackets)
+
+        Examples of patterns that will be masked:
+            - 'password=secret123' -> 'password=***MASKED***'
+            - 'token: abc123' -> 'token: ***MASKED***'
+            - 'API_KEY=sk-123;other=val' -> 'API_KEY=***MASKED***;other=val'
+        """
+        ic.configureSensitiveKeys(keys=['password', 'token'])
+
+        # Test semicolon-separated connection string
+        connection_string = 'host=localhost;password=secret123;port=5432'
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(connection_string)
+        output = err.getvalue()
+        self.assertNotIn('secret123', output)
+        self.assertIn('***MASKED***', output)
+        self.assertIn('localhost', output)
+
+    def test_mask_string_patterns_with_colon_separator(self):
+        """String patterns with colon separator should be masked."""
+        ic.configureSensitiveKeys(keys=['token'])
+        config_line = 'token: mytoken123, debug: true'
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(config_line)
+        output = err.getvalue()
+        self.assertNotIn('mytoken123', output)
+        self.assertIn('***MASKED***', output)
+        self.assertIn('debug', output)
+
+    def test_mask_string_patterns_with_whitespace(self):
+        """String patterns with whitespace around separator should be masked."""
+        ic.configureSensitiveKeys(keys=['password'])
+        config_line = 'password = mysecret'
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(config_line)
+        output = err.getvalue()
+        self.assertNotIn('mysecret', output)
+        self.assertIn('***MASKED***', output)
+
+    def test_mask_list_of_dicts(self):
+        """Lists containing dicts with sensitive keys should be masked."""
+        ic.configureSensitiveKeys(keys=['token'])
+        users = [{'name': 'alice', 'token': 'tok1'}, {'name': 'bob', 'token': 'tok2'}]
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(users)
+        output = err.getvalue()
+        self.assertNotIn('tok1', output)
+        self.assertNotIn('tok2', output)
+        self.assertIn('alice', output)
+        self.assertIn('bob', output)
+
+    def test_custom_placeholder(self):
+        """Custom placeholder should be used when configured."""
+        ic.configureSensitiveKeys(keys=['password'], placeholder='[REDACTED]')
+        password = 'secret123'
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(password)
+        output = err.getvalue()
+        self.assertNotIn('secret123', output)
+        self.assertIn('[REDACTED]', output)
+
+    def test_add_keys(self):
+        """Keys can be added incrementally."""
+        ic.configureSensitiveKeys(keys=['password'])
+        ic.configureSensitiveKeys(add=['api_key'])
+
+        data = {'password': 'pass1', 'api_key': 'key1'}
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(data)
+        output = err.getvalue()
+        self.assertNotIn('pass1', output)
+        self.assertNotIn('key1', output)
+
+    def test_remove_keys(self):
+        """Keys can be removed from masking."""
+        ic.configureSensitiveKeys(keys=['password', 'api_key'])
+        ic.configureSensitiveKeys(remove=['password'])
+
+        data = {'password': 'pass1', 'api_key': 'key1'}
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(data)
+        output = err.getvalue()
+        self.assertIn('pass1', output)  # Should NOT be masked
+        self.assertNotIn('key1', output)  # Should be masked
+
+    def test_clear_keys(self):
+        """All keys can be cleared."""
+        ic.configureSensitiveKeys(keys=['password'])
+        ic.configureSensitiveKeys(clear=True)
+
+        password = 'secret123'
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(password)
+        self.assertIn('secret123', err.getvalue())
+
+    def test_sensitive_keys_property(self):
+        """sensitiveKeys property should return current keys."""
+        ic.configureSensitiveKeys(keys=['password', 'token'])
+        keys = ic.sensitiveKeys
+        self.assertEqual(keys, {'password', 'token'})
+
+    def test_sensitive_placeholder_property(self):
+        """sensitivePlaceholder property should return current placeholder."""
+        ic.configureSensitiveKeys(keys=['test'], placeholder='[HIDDEN]')
+        self.assertEqual(ic.sensitivePlaceholder, '[HIDDEN]')
+
+    def test_mask_tuple_values(self):
+        """Tuples containing dicts with sensitive keys should be masked."""
+        ic.configureSensitiveKeys(keys=['secret'])
+        data = ({'secret': 'val1'}, {'public': 'val2'})
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(data)
+        output = err.getvalue()
+        self.assertNotIn('val1', output)
+        self.assertIn('val2', output)
+
+    def test_non_sensitive_data_unchanged(self):
+        """Non-sensitive data should remain unchanged."""
+        ic.configureSensitiveKeys(keys=['password'])
+        data = {'username': 'alice', 'email': 'alice@example.com', 'age': 30}
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(data)
+        output = err.getvalue()
+        self.assertIn('alice', output)
+        self.assertIn('alice@example.com', output)
+        self.assertIn('30', output)
+
+    def test_multiple_sensitive_keys(self):
+        """Multiple sensitive keys should all be masked."""
+        ic.configureSensitiveKeys(keys=['password', 'api_key', 'token', 'secret'])
+        data = {
+            'password': 'pass123',
+            'api_key': 'key456',
+            'token': 'tok789',
+            'secret': 'sec000',
+            'public': 'visible'
+        }
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(data)
+        output = err.getvalue()
+        self.assertNotIn('pass123', output)
+        self.assertNotIn('key456', output)
+        self.assertNotIn('tok789', output)
+        self.assertNotIn('sec000', output)
+        self.assertIn('visible', output)
+
+    def test_format_method_also_masks(self):
+        """The format() method should also mask sensitive values."""
+        ic.configureSensitiveKeys(keys=['password'])
+        password = 'secret123'
+        result = ic.format(password)
+        self.assertNotIn('secret123', result)
+        self.assertIn('***MASKED***', result)
+
+
+class TestSensitiveKeyHelpers(unittest.TestCase):
+    """Tests for the module-level helper functions for sensitive key masking."""
+
+    def test_is_sensitive_key_exact_match(self):
+        """is_sensitive_key should match exact key names."""
+        self.assertTrue(is_sensitive_key('password', {'password'}))
+        self.assertTrue(is_sensitive_key('api_key', {'api_key'}))
+
+    def test_is_sensitive_key_case_insensitive(self):
+        """is_sensitive_key should be case-insensitive."""
+        self.assertTrue(is_sensitive_key('PASSWORD', {'password'}))
+        self.assertTrue(is_sensitive_key('password', {'PASSWORD'}))
+        self.assertTrue(is_sensitive_key('PaSsWoRd', {'password'}))
+
+    def test_is_sensitive_key_substring_match(self):
+        """is_sensitive_key should match substrings."""
+        self.assertTrue(is_sensitive_key('user_password', {'password'}))
+        self.assertTrue(is_sensitive_key('passwordHash', {'password'}))
+        self.assertTrue(is_sensitive_key('db_password_encrypted', {'password'}))
+
+    def test_is_sensitive_key_no_match(self):
+        """is_sensitive_key should return False for non-matching keys."""
+        self.assertFalse(is_sensitive_key('username', {'password'}))
+        self.assertFalse(is_sensitive_key('email', {'password', 'token'}))
+
+    def test_is_sensitive_key_empty_sensitive_keys(self):
+        """is_sensitive_key should return False for empty sensitive keys set."""
+        self.assertFalse(is_sensitive_key('password', set()))
+
+    def test_mask_sensitive_value_dict(self):
+        """_mask_sensitive_value should mask dict values with sensitive keys."""
+        data = {'password': 'secret', 'username': 'alice'}
+        result = _mask_sensitive_value(data, {'password'}, '***')
+        self.assertEqual(result, {'password': '***', 'username': 'alice'})
+
+    def test_mask_sensitive_value_nested_dict(self):
+        """_mask_sensitive_value should mask nested dict values."""
+        data = {'config': {'password': 'secret', 'host': 'localhost'}}
+        result = _mask_sensitive_value(data, {'password'}, '***')
+        self.assertEqual(result, {'config': {'password': '***', 'host': 'localhost'}})
+
+    def test_mask_sensitive_value_list(self):
+        """_mask_sensitive_value should mask values in lists."""
+        data = [{'password': 'pass1'}, {'password': 'pass2'}]
+        result = _mask_sensitive_value(data, {'password'}, '***')
+        self.assertEqual(result, [{'password': '***'}, {'password': '***'}])
+
+    def test_mask_sensitive_value_string_pattern(self):
+        """_mask_sensitive_value should mask patterns in strings."""
+        data = 'password=secret123;host=localhost'
+        result = _mask_sensitive_value(data, {'password'}, '***')
+        self.assertEqual(result, 'password=***;host=localhost')
+
+    def test_mask_sensitive_value_empty_sensitive_keys(self):
+        """_mask_sensitive_value should return unchanged object for empty keys."""
+        data = {'password': 'secret'}
+        result = _mask_sensitive_value(data, set(), '***')
+        self.assertEqual(result, data)
+
+    def test_mask_sensitive_value_preserves_non_sensitive(self):
+        """_mask_sensitive_value should preserve non-sensitive values."""
+        data = {'public': 'visible', 'count': 42, 'active': True}
+        result = _mask_sensitive_value(data, {'password'}, '***')
+        self.assertEqual(result, data)

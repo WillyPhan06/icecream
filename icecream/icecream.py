@@ -15,9 +15,10 @@ import ast
 import enum
 import inspect
 import pprint
+import re
 import sys
 from types import FrameType
-from typing import Optional, cast, Any, Callable, Generator, List, Sequence, Tuple, Type, Union, cast, Literal
+from typing import Optional, cast, Any, Callable, Generator, List, Sequence, Set, Tuple, Type, Union, cast, Literal
 import warnings
 from datetime import datetime
 import functools
@@ -155,6 +156,7 @@ DEFAULT_CONTEXT_DELIMITER = '- '
 DEFAULT_OUTPUT_FUNCTION = colorizedStderrPrint
 DEFAULT_ARG_TO_STRING_FUNCTION = safe_pformat
 DEFAULT_INDENTATION_STR = '    '  # 4 spaces per level.
+DEFAULT_SENSITIVE_PLACEHOLDER = '***MASKED***'
 
 """
 This info message is printed instead of the arguments when icecream
@@ -281,6 +283,101 @@ def _(obj: str) -> str:
     return "'" + obj.replace('\\', '\\\\') + "'"
 
 
+def is_sensitive_key(key: str, sensitive_keys: Set[str]) -> bool:
+    """Check if a key name matches any sensitive key pattern.
+
+    Matching is case-insensitive and uses substring matching, so
+    'password' will match 'PASSWORD', 'user_password', 'passwordHash', etc.
+
+    Args:
+        key: The key name to check.
+        sensitive_keys: Set of sensitive key patterns to match against.
+
+    Returns:
+        True if the key matches any sensitive pattern, False otherwise.
+    """
+    if not sensitive_keys:
+        return False
+    key_lower = str(key).lower()
+    sensitive_keys_lower = {k.lower() for k in sensitive_keys}
+    for sensitive in sensitive_keys_lower:
+        if sensitive in key_lower:
+            return True
+    return False
+
+
+def _mask_sensitive_value(
+    obj: object,
+    sensitive_keys: Set[str],
+    placeholder: str
+) -> object:
+    """Recursively mask sensitive values in objects.
+
+    This function processes various data types and masks sensitive values:
+    - For dicts: masks values where the key matches a sensitive pattern
+    - For lists/tuples/sets: recursively processes each element
+    - For strings: masks patterns like "password=xxx" or "api_key: xxx"
+
+    The string pattern matching uses regex to find key-value patterns in the
+    format: <sensitive_key><separator><value> where separator is '=' or ':'
+    with optional whitespace.
+
+    Args:
+        obj: The object to mask sensitive values in.
+        sensitive_keys: Set of key names (case-insensitive) to mask.
+        placeholder: The placeholder string to use for masked values.
+
+    Returns:
+        A copy of the object with sensitive values masked.
+    """
+    if not sensitive_keys:
+        return obj
+
+    # Lowercase all sensitive keys for case-insensitive matching
+    sensitive_keys_lower = {k.lower() for k in sensitive_keys}
+
+    def mask_recursive(value: object) -> object:
+        if isinstance(value, dict):
+            result = {}
+            for k, v in value.items():
+                if is_sensitive_key(str(k), sensitive_keys):
+                    result[k] = placeholder
+                else:
+                    result[k] = mask_recursive(v)
+            return result
+        elif isinstance(value, list):
+            return [mask_recursive(item) for item in value]
+        elif isinstance(value, tuple):
+            return tuple(mask_recursive(item) for item in value)
+        elif isinstance(value, set):
+            return {mask_recursive(item) for item in value}
+        elif isinstance(value, str):
+            # Mask patterns like "password=xxx" or "api_key: xxx" in strings
+            # Regex pattern explanation:
+            #   - Group 1: (<sensitive_key>\s*[:=]\s*) - captures the key and separator
+            #     - <sensitive_key> - the sensitive key name (escaped for regex)
+            #     - \s* - optional whitespace
+            #     - [:=] - either ':' or '=' as separator
+            #     - \s* - optional whitespace after separator
+            #   - Group 2: ([^\s,}}\]"\'`;]+) - captures the value to be masked
+            #     - [^\s,}}\]"\'`;]+ - one or more characters that are NOT:
+            #       - \s (whitespace)
+            #       - , (comma - common delimiter)
+            #       - }} (closing brace)
+            #       - \] (closing bracket)
+            #       - "\'` (quotes)
+            #       - ; (semicolon - common delimiter)
+            result = value
+            for sensitive in sensitive_keys_lower:
+                pattern = rf'({re.escape(sensitive)}\s*[:=]\s*)([^\s,}}\]"\'`;]+)'
+                result = re.sub(pattern, rf'\1{placeholder}', result, flags=re.IGNORECASE)
+            return result
+        else:
+            return value
+
+    return mask_recursive(obj)
+
+
 class IceCreamDebugger:
     _pairDelimiter = ', '  # Used by the tests in tests/.
     lineWrapWidth = DEFAULT_LINE_WRAP_WIDTH
@@ -290,7 +387,9 @@ class IceCreamDebugger:
                  outputFunction: Callable[[str], None]=DEFAULT_OUTPUT_FUNCTION,
                  argToStringFunction: Union[_SingleDispatchCallable, Callable[[Any], str]]=argumentToString, includeContext: bool=False,
                  contextAbsPath: bool=False, enableIndentation: bool=False,
-                 indentationStr: str=DEFAULT_INDENTATION_STR):
+                 indentationStr: str=DEFAULT_INDENTATION_STR,
+                 sensitiveKeys: Optional[Set[str]]=None,
+                 sensitivePlaceholder: str=DEFAULT_SENSITIVE_PLACEHOLDER):
         self.enabled = True
         self.prefix = prefix
         self.includeContext = includeContext
@@ -300,6 +399,8 @@ class IceCreamDebugger:
         self.enableIndentation = enableIndentation
         self.indentationStr = indentationStr
         self._baseStackDepth: Optional[int] = None
+        self._sensitiveKeys: Set[str] = sensitiveKeys if sensitiveKeys is not None else set()
+        self._sensitivePlaceholder = sensitivePlaceholder
 
     def __call__(self, *args: object) -> object:
         if self.enabled:
@@ -372,11 +473,28 @@ class IceCreamDebugger:
         out = self._constructArgumentOutput(prefix, context, pairs)
         return out
 
+    def _maskAndConvert(self, val: object) -> str:
+        """Mask sensitive values and convert to string representation.
+
+        This method first masks any sensitive values in the object using
+        the configured sensitive keys and placeholder, then converts the
+        result to a string using argToStringFunction.
+
+        Args:
+            val: The value to mask and convert.
+
+        Returns:
+            String representation with sensitive values masked.
+        """
+        masked = _mask_sensitive_value(
+            val, self._sensitiveKeys, self._sensitivePlaceholder)
+        return self.argToStringFunction(masked)
+
     def _constructArgumentOutput(self, prefix: str, context: str, pairs: Sequence[Tuple[Union[str, Sentinel], str]]) -> str:
         def argPrefix(arg: str) -> str:
             return '%s: ' % arg
 
-        pairs = [(arg, self.argToStringFunction(val)) for arg, val in pairs]
+        pairs = [(arg, self._maskAndConvert(val)) for arg, val in pairs]
         # For cleaner output, if <arg> is a literal, eg 3, "a string",
         # b'bytes', etc, only output the value, not the argument and the
         # value, because the argument and the value will be identical or
@@ -564,6 +682,95 @@ class IceCreamDebugger:
 
         if indentationStr is not Sentinel.absent:
             self.indentationStr = indentationStr
+
+    def configureSensitiveKeys(
+        self,
+        keys: Optional[Sequence[str]] = None,
+        placeholder: Union[str, Literal[Sentinel.absent]] = Sentinel.absent,
+        add: Optional[Sequence[str]] = None,
+        remove: Optional[Sequence[str]] = None,
+        clear: bool = False
+    ) -> None:
+        """Configure sensitive key masking for ic() output.
+
+        This method allows you to specify keys (like 'password', 'api_key',
+        'token', etc.) whose values should be masked in ic() output to prevent
+        accidental exposure of sensitive information.
+
+        Key matching is case-insensitive and uses substring matching, so
+        configuring 'password' will mask keys like 'password', 'PASSWORD',
+        'user_password', 'passwordHash', etc.
+
+        Args:
+            keys: A sequence of key names to set as sensitive. This replaces
+                any existing sensitive keys. Use None to leave existing keys
+                unchanged.
+            placeholder: The string to display instead of sensitive values.
+                Default is '***MASKED***'.
+            add: A sequence of key names to add to the existing sensitive keys.
+            remove: A sequence of key names to remove from the sensitive keys.
+            clear: If True, clear all sensitive keys before applying other
+                operations. Default is False.
+
+        Raises:
+            TypeError: If no arguments are provided.
+
+        Example:
+            # Basic usage - mask password and api_key
+            ic.configureSensitiveKeys(keys=['password', 'api_key', 'token'])
+
+            password = 'secret123'
+            ic(password)  # Output: ic| password: '***MASKED***'
+
+            config = {'api_key': 'sk-abc123', 'debug': True}
+            ic(config)  # Output: ic| config: {'api_key': '***MASKED***', 'debug': True}
+
+            # Add more keys to existing configuration
+            ic.configureSensitiveKeys(add=['secret', 'auth'])
+
+            # Remove a key from masking
+            ic.configureSensitiveKeys(remove=['token'])
+
+            # Custom placeholder
+            ic.configureSensitiveKeys(placeholder='[REDACTED]')
+
+            # Clear all sensitive keys (disable masking)
+            ic.configureSensitiveKeys(clear=True)
+        """
+        noParameterProvided = (
+            keys is None and
+            placeholder is Sentinel.absent and
+            add is None and
+            remove is None and
+            not clear
+        )
+        if noParameterProvided:
+            raise TypeError('configureSensitiveKeys() missing at least one argument')
+
+        if clear:
+            self._sensitiveKeys = set()
+
+        if keys is not None:
+            self._sensitiveKeys = set(keys)
+
+        if add is not None:
+            self._sensitiveKeys.update(add)
+
+        if remove is not None:
+            self._sensitiveKeys -= set(remove)
+
+        if placeholder is not Sentinel.absent:
+            self._sensitivePlaceholder = placeholder
+
+    @property
+    def sensitiveKeys(self) -> Set[str]:
+        """Get the current set of sensitive keys."""
+        return self._sensitiveKeys.copy()
+
+    @property
+    def sensitivePlaceholder(self) -> str:
+        """Get the current placeholder string for masked values."""
+        return self._sensitivePlaceholder
 
 
 ic = IceCreamDebugger()
