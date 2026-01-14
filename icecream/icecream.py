@@ -19,7 +19,7 @@ import re
 import sys
 from collections import deque
 from types import FrameType
-from typing import Deque, Optional, cast, Any, Callable, Generator, List, Sequence, Set, Tuple, Type, Union, cast, Literal
+from typing import Deque, Optional, TextIO, cast, Any, Callable, Generator, List, Sequence, Set, Tuple, Type, Union, cast, Literal
 import warnings
 from datetime import datetime
 import functools
@@ -410,6 +410,10 @@ class IceCreamDebugger:
         self._limitEvery: Optional[int] = None
         # Using deque for O(1) popleft operations when buffer exceeds limitLast
         self._lastNBuffer: Deque[Tuple[str, int]] = deque()  # (output, indentLevel) tuples
+        # File logging state
+        self._logFile: Optional[TextIO] = None
+        self._logFilePath: Optional[str] = None
+        self._logFileMode: str = 'a'  # 'a' for append, 'w' for overwrite
 
     def __call__(self, *args: object) -> object:
         if self.enabled:
@@ -448,6 +452,8 @@ class IceCreamDebugger:
             elif shouldOutput:
                 self.outputFunction(out)
                 self._outputCount += 1
+                # Write to log file if logging is enabled
+                self._writeToLogFile(out)
 
         if not args:  # E.g. ic().
             passthrough = None
@@ -677,6 +683,8 @@ class IceCreamDebugger:
             for out, indentLevel in self._lastNBuffer:
                 self.outputFunction(out)
                 self._outputCount += 1
+                # Write to log file if logging is enabled
+                self._writeToLogFile(out)
             self._lastNBuffer.clear()
 
     def configureOutput(
@@ -691,7 +699,9 @@ class IceCreamDebugger:
         indentationStr: Union[str, Literal[Sentinel.absent]] = Sentinel.absent,
         limitFirst: Union[Optional[int], Literal[Sentinel.absent]] = Sentinel.absent,
         limitLast: Union[Optional[int], Literal[Sentinel.absent]] = Sentinel.absent,
-        limitEvery: Union[Optional[int], Literal[Sentinel.absent]] = Sentinel.absent
+        limitEvery: Union[Optional[int], Literal[Sentinel.absent]] = Sentinel.absent,
+        logFile: Union[Optional[str], Literal[Sentinel.absent]] = Sentinel.absent,
+        logMode: Union[Literal['a', 'w'], Literal[Sentinel.absent]] = Sentinel.absent
     ) -> None:
         """Configure ic() output settings.
 
@@ -756,6 +766,23 @@ class IceCreamDebugger:
                 helps identify trends, patterns, or the point where behavior
                 changes without wading through excessive output.
 
+            logFile: Path to a file where ic() output will be logged. When set,
+                all ic() output will be written to this file in addition to the
+                normal output. Set to None to disable file logging. Default is None.
+
+                Use case: When running long-running code, you can save ic() output
+                to a file for later analysis. This allows you to compare outputs
+                across different runs and timelines without waiting for the code
+                to finish each time you want to inspect the debug messages.
+
+            logMode: How to handle the log file when logging is enabled.
+                - 'a': Append to the file if it exists (default).
+                - 'w': Overwrite the file if it exists.
+
+                Use case: Use 'a' when you want to accumulate logs across
+                multiple runs for comparison. Use 'w' when you want each run
+                to start with a fresh log file.
+
         Note:
             - limitFirst and limitEvery can be combined: output appears for
               calls that satisfy BOTH conditions. For example, limitFirst=50
@@ -812,6 +839,17 @@ class IceCreamDebugger:
 
             # Reset counters for new debugging session
             ic.resetCallLimit()
+
+            # Enable file logging to save debug output for later analysis
+            ic.configureOutput(logFile='debug.log')
+            for i in range(1000):
+                ic(i)  # Output to both stderr and debug.log
+
+            # Overwrite log file instead of appending
+            ic.configureOutput(logFile='debug.log', logMode='w')
+
+            # Disable file logging
+            ic.configureOutput(logFile=None)
         """
         noParameterProvided = all(
             v is Sentinel.absent for k, v in locals().items() if k != 'self')
@@ -852,6 +890,24 @@ class IceCreamDebugger:
 
         if limitEvery is not Sentinel.absent:
             self._limitEvery = limitEvery
+
+        if logMode is not Sentinel.absent:
+            if logMode not in ('a', 'w'):
+                raise ValueError(
+                    f"logMode must be 'a' (append) or 'w' (overwrite), got {logMode!r}")
+            self._logFileMode = logMode
+
+        if logFile is not Sentinel.absent:
+            # Close existing log file if open
+            if self._logFile is not None:
+                self._logFile.close()
+                self._logFile = None
+                self._logFilePath = None
+
+            if logFile is not None:
+                # Open new log file
+                self._logFilePath = logFile
+                self._logFile = open(logFile, self._logFileMode, encoding='utf-8')
 
     def configureSensitiveKeys(
         self,
@@ -966,6 +1022,36 @@ class IceCreamDebugger:
     def limitEvery(self) -> Optional[int]:
         """Get the current limitEvery setting."""
         return self._limitEvery
+
+    @property
+    def logFilePath(self) -> Optional[str]:
+        """Get the current log file path, or None if logging is disabled."""
+        return self._logFilePath
+
+    @property
+    def logMode(self) -> str:
+        """Get the current log file mode ('a' for append, 'w' for overwrite)."""
+        return self._logFileMode
+
+    @property
+    def isLogging(self) -> bool:
+        """Check if file logging is currently enabled."""
+        return self._logFile is not None
+
+    def _writeToLogFile(self, s: str) -> None:
+        """Write output to the log file if logging is enabled.
+
+        This is an internal method that writes the formatted ic() output
+        to the log file. It strips ANSI color codes before writing.
+
+        Args:
+            s: The formatted output string to log.
+        """
+        if self._logFile is not None:
+            # Strip ANSI escape codes for clean log output
+            clean_output = re.sub(r'\x1b\[[0-9;]*m', '', s)
+            self._logFile.write(clean_output + '\n')
+            self._logFile.flush()  # Ensure output is written immediately
 
 
 ic = IceCreamDebugger()

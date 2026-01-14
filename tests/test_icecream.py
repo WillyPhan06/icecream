@@ -2034,3 +2034,335 @@ class TestCallLimiting(unittest.TestCase):
                         "Should count only enabled calls: 1,2,5,7,8,9")
         self.assertEqual(ic.outputCount, 6,
                         "With no limits, all enabled calls should output")
+
+
+class TestFileLogging(unittest.TestCase):
+    """Tests for the file logging feature."""
+
+    def setUp(self):
+        ic._pairDelimiter = TEST_PAIR_DELIMITER
+        # Ensure logging is disabled
+        ic.configureOutput(logFile=None)
+
+    def tearDown(self):
+        # Disable logging after each test
+        ic.configureOutput(logFile=None)
+        # Clean up any test log files
+        import os
+        for f in ['test_log.log', 'test_append.log', 'test_overwrite.log',
+                  'test_context.log', 'test_limit.log', 'test_multiline.log',
+                  'test_indent.log', 'test_ansi.log']:
+            if os.path.exists(f):
+                os.remove(f)
+
+    def test_logging_disabled_by_default(self):
+        """File logging should be disabled by default."""
+        self.assertFalse(ic.isLogging)
+        self.assertIsNone(ic.logFilePath)
+
+    def test_enable_logging_creates_file(self):
+        """configureOutput(logFile=...) should create a log file."""
+        ic.configureOutput(logFile='test_log.log')
+        self.assertTrue(ic.isLogging)
+        self.assertEqual(ic.logFilePath, 'test_log.log')
+        import os
+        self.assertTrue(os.path.exists('test_log.log'))
+
+    def test_disable_logging_closes_file(self):
+        """configureOutput(logFile=None) should close the log file."""
+        ic.configureOutput(logFile='test_log.log')
+        self.assertTrue(ic.isLogging)
+        ic.configureOutput(logFile=None)
+        self.assertFalse(ic.isLogging)
+        self.assertIsNone(ic.logFilePath)
+
+    def test_basic_logging(self):
+        """ic() output should be written to the log file."""
+        ic.configureOutput(logFile='test_log.log')
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(a)
+            ic(b)
+
+        ic.configureOutput(logFile=None)
+
+        with open('test_log.log', 'r') as f:
+            content = f.read()
+
+        self.assertIn('a: 1', content)
+        self.assertIn('b: 2', content)
+
+    def test_logging_strips_ansi_codes(self):
+        """Log file should not contain ANSI escape codes."""
+        ic.configureOutput(logFile='test_ansi.log')
+
+        with capture_standard_streams() as (out, err):
+            ic({1: 'test'})  # Colorized output
+
+        ic.configureOutput(logFile=None)
+
+        with open('test_ansi.log', 'r') as f:
+            content = f.read()
+
+        # ANSI escape codes start with \x1b[
+        self.assertNotIn('\x1b[', content)
+        # But the content should still be there
+        self.assertIn('1', content)
+        self.assertIn('test', content)
+
+    def test_logging_append_mode(self):
+        """Append mode ('a') should add to existing file content."""
+        # First logging session
+        ic.configureOutput(logFile='test_append.log', logMode='a')
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(a)
+        ic.configureOutput(logFile=None)
+
+        # Second logging session (append)
+        ic.configureOutput(logFile='test_append.log', logMode='a')
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(b)
+        ic.configureOutput(logFile=None)
+
+        with open('test_append.log', 'r') as f:
+            content = f.read()
+
+        # Both outputs should be present
+        self.assertIn('a: 1', content)
+        self.assertIn('b: 2', content)
+
+    def test_logging_overwrite_mode(self):
+        """Overwrite mode ('w') should replace existing file content."""
+        # First logging session
+        ic.configureOutput(logFile='test_overwrite.log', logMode='a')
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(a)
+        ic.configureOutput(logFile=None)
+
+        # Second logging session (overwrite)
+        ic.configureOutput(logFile='test_overwrite.log', logMode='w')
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(b)
+        ic.configureOutput(logFile=None)
+
+        with open('test_overwrite.log', 'r') as f:
+            content = f.read()
+
+        # Only second output should be present
+        self.assertNotIn('a: 1', content)
+        self.assertIn('b: 2', content)
+
+    def test_logging_with_configure_output(self):
+        """configureOutput should enable/disable logging."""
+        ic.configureOutput(logFile='test_log.log')
+        self.assertTrue(ic.isLogging)
+
+        ic.configureOutput(logFile=None)
+        self.assertFalse(ic.isLogging)
+
+    def test_logging_with_context(self):
+        """Logging should work with includeContext enabled."""
+        ic.configureOutput(includeContext=True, logFile='test_context.log')
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(a)
+
+        ic.configureOutput(logFile=None)
+        ic.configureOutput(includeContext=False)
+
+        with open('test_context.log', 'r') as f:
+            content = f.read()
+
+        self.assertIn('a: 1', content)
+        self.assertIn('test_icecream.py:', content)
+        self.assertIn('in test_logging_with_context()', content)
+
+    def test_logging_with_limit_first(self):
+        """Logging should respect limitFirst setting."""
+        ic.configureOutput(limitFirst=2, logFile='test_limit.log')
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)  # Should log
+            ic(2)  # Should log
+            ic(3)  # Should NOT log (exceeds limit)
+
+        ic.configureOutput(logFile=None)
+        ic.configureOutput(limitFirst=None)
+
+        with open('test_limit.log', 'r') as f:
+            content = f.read()
+
+        self.assertIn('1', content)
+        self.assertIn('2', content)
+        self.assertNotIn('3', content)
+
+    def test_logging_with_limit_last_flush(self):
+        """Logging should work when flushing limitLast buffer."""
+        ic.configureOutput(limitLast=2, logFile='test_limit.log')
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)  # Buffered, then dropped
+            ic(2)  # Buffered, then dropped
+            ic(3)  # Buffered, kept
+            ic(4)  # Buffered, kept
+
+        # Nothing logged yet (buffered)
+        with open('test_limit.log', 'r') as f:
+            content = f.read()
+        self.assertEqual(content, '')
+
+        # Flush - should log last 2
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        ic.configureOutput(logFile=None)
+        ic.configureOutput(limitLast=None)
+
+        with open('test_limit.log', 'r') as f:
+            content = f.read()
+
+        self.assertNotIn('1', content)
+        self.assertNotIn('2', content)
+        self.assertIn('3', content)
+        self.assertIn('4', content)
+
+    def test_logging_multiline_output(self):
+        """Multiline output should be logged correctly."""
+        ic.configureOutput(logFile='test_multiline.log')
+
+        multilineStr = 'line1\nline2\nline3'
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(multilineStr)
+
+        ic.configureOutput(logFile=None)
+
+        with open('test_multiline.log', 'r') as f:
+            content = f.read()
+
+        self.assertIn('multilineStr', content)
+        self.assertIn('line1', content)
+        self.assertIn('line2', content)
+        self.assertIn('line3', content)
+
+    def test_logging_with_indentation(self):
+        """Logging should preserve indentation."""
+        ic.configureOutput(enableIndentation=True, logFile='test_indent.log')
+        ic.resetIndentation()
+
+        def inner():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(b)
+
+        def outer():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(a)
+            inner()
+
+        outer()
+
+        ic.configureOutput(logFile=None)
+        ic.configureOutput(enableIndentation=False)
+
+        with open('test_indent.log', 'r') as f:
+            lines = f.readlines()
+
+        # First line should not be indented
+        self.assertTrue(lines[0].strip().startswith('ic|'))
+        # Second line should be indented
+        self.assertTrue(lines[1].startswith('    '))
+
+    def test_log_mode_property(self):
+        """logMode property should reflect current mode."""
+        ic.configureOutput(logFile='test_log.log', logMode='a')
+        self.assertEqual(ic.logMode, 'a')
+        ic.configureOutput(logFile=None)
+
+        ic.configureOutput(logFile='test_log.log', logMode='w')
+        self.assertEqual(ic.logMode, 'w')
+        ic.configureOutput(logFile=None)
+
+    def test_logging_output_also_goes_to_stderr(self):
+        """Logging should not prevent normal output to stderr."""
+        ic.configureOutput(logFile='test_log.log')
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(a)
+
+        stderr_output = err.getvalue()
+
+        ic.configureOutput(logFile=None)
+
+        # Should also output to stderr
+        self.assertIn('a: 1', stderr_output)
+
+    def test_switching_log_files(self):
+        """Switching to a new log file should close the old one."""
+        ic.configureOutput(logFile='test_log.log')
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(a)
+
+        ic.configureOutput(logFile='test_append.log')  # Switch to new file
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(b)
+
+        ic.configureOutput(logFile=None)
+
+        with open('test_log.log', 'r') as f:
+            content1 = f.read()
+        with open('test_append.log', 'r') as f:
+            content2 = f.read()
+
+        self.assertIn('a: 1', content1)
+        self.assertNotIn('b: 2', content1)
+        self.assertIn('b: 2', content2)
+        self.assertNotIn('a: 1', content2)
+
+    def test_logging_with_ic_disabled(self):
+        """When ic is disabled, nothing should be logged."""
+        ic.configureOutput(logFile='test_log.log')
+        ic.disable()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(a)
+
+        ic.enable()
+        ic.configureOutput(logFile=None)
+
+        with open('test_log.log', 'r') as f:
+            content = f.read()
+
+        self.assertEqual(content, '')
+
+    def test_logging_with_sensitive_data_masking(self):
+        """Sensitive data should be masked in log output."""
+        ic.configureSensitiveKeys(keys=['password'])
+        ic.configureOutput(logFile='test_log.log')
+
+        password = 'supersecret123'
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(password)
+
+        ic.configureOutput(logFile=None)
+        ic.configureSensitiveKeys(clear=True)
+
+        with open('test_log.log', 'r') as f:
+            content = f.read()
+
+        self.assertNotIn('supersecret123', content)
+        self.assertIn('***MASKED***', content)
+
+    def test_invalid_log_mode_raises_error(self):
+        """Invalid logMode should raise ValueError with helpful message."""
+        with self.assertRaises(ValueError) as context:
+            ic.configureOutput(logMode='append')
+
+        self.assertIn("logMode must be 'a' (append) or 'w' (overwrite)", str(context.exception))
+        self.assertIn("'append'", str(context.exception))
+
+        with self.assertRaises(ValueError) as context:
+            ic.configureOutput(logMode='x')
+
+        self.assertIn("logMode must be 'a' (append) or 'w' (overwrite)", str(context.exception))
+        self.assertIn("'x'", str(context.exception))
