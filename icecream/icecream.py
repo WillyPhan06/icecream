@@ -17,8 +17,9 @@ import inspect
 import pprint
 import re
 import sys
+from collections import deque
 from types import FrameType
-from typing import Optional, cast, Any, Callable, Generator, List, Sequence, Set, Tuple, Type, Union, cast, Literal
+from typing import Deque, Optional, cast, Any, Callable, Generator, List, Sequence, Set, Tuple, Type, Union, cast, Literal
 import warnings
 from datetime import datetime
 import functools
@@ -401,9 +402,21 @@ class IceCreamDebugger:
         self._baseStackDepth: Optional[int] = None
         self._sensitiveKeys: Set[str] = sensitiveKeys if sensitiveKeys is not None else set()
         self._sensitivePlaceholder = sensitivePlaceholder
+        # Call limiting state
+        self._callCount = 0
+        self._outputCount = 0
+        self._limitFirst: Optional[int] = None
+        self._limitLast: Optional[int] = None
+        self._limitEvery: Optional[int] = None
+        # Using deque for O(1) popleft operations when buffer exceeds limitLast
+        self._lastNBuffer: Deque[Tuple[str, int]] = deque()  # (output, indentLevel) tuples
 
     def __call__(self, *args: object) -> object:
         if self.enabled:
+            # Increment call counter for every ic() call
+            self._callCount += 1
+            currentCallNum = self._callCount
+
             currentFrame = inspect.currentframe()
             assert currentFrame is not None and currentFrame.f_back is not None
             callFrame = currentFrame.f_back
@@ -421,7 +434,20 @@ class IceCreamDebugger:
             if indentLevel > 0:
                 indent = self.indentationStr * indentLevel
                 out = '\n'.join(indent + line for line in out.splitlines())
-            self.outputFunction(out)
+
+            # Determine if this call should produce output
+            shouldOutput = self._shouldOutput(currentCallNum)
+
+            # Handle limitLast buffering
+            if self._limitLast is not None:
+                # Buffer this output for later flushing
+                self._lastNBuffer.append((out, indentLevel))
+                # Keep only the last N entries (O(1) operation with deque)
+                if len(self._lastNBuffer) > self._limitLast:
+                    self._lastNBuffer.popleft()
+            elif shouldOutput:
+                self.outputFunction(out)
+                self._outputCount += 1
 
         if not args:  # E.g. ic().
             passthrough = None
@@ -431,6 +457,39 @@ class IceCreamDebugger:
             passthrough = args
 
         return passthrough
+
+    def _shouldOutput(self, callNum: int) -> bool:
+        """Determine if the current call should produce output based on limits.
+
+        This method checks limitFirst and limitEvery settings to decide if
+        output should be produced. limitLast is handled separately via buffering.
+
+        Args:
+            callNum: The current call number (1-indexed).
+
+        Returns:
+            True if output should be produced, False otherwise.
+        """
+        # If no limits are set, always output
+        if self._limitFirst is None and self._limitEvery is None:
+            return True
+
+        shouldOutput = True
+
+        # Check limitFirst: only output if within first N calls
+        if self._limitFirst is not None:
+            if callNum > self._limitFirst:
+                shouldOutput = False
+
+        # Check limitEvery: only output every Nth call (1st, N+1th, 2N+1th, ...)
+        # When combined with limitFirst, both conditions must be satisfied
+        if self._limitEvery is not None and shouldOutput:
+            # Call numbers are 1-indexed, so call 1 should output,
+            # then call 1+N, 1+2N, etc.
+            if (callNum - 1) % self._limitEvery != 0:
+                shouldOutput = False
+
+        return shouldOutput
 
     def format(self, *args: object) -> str:
         currentFrame = inspect.currentframe()
@@ -594,6 +653,32 @@ class IceCreamDebugger:
         """
         self._baseStackDepth = None
 
+    def resetCallLimit(self) -> None:
+        """Reset call limit counters and clear the lastN buffer.
+
+        Call this method when starting a new debugging session to reset the
+        call counter to zero and clear any buffered output from limitLast.
+        The limit settings (limitFirst, limitLast, limitEvery) are preserved.
+        """
+        self._callCount = 0
+        self._outputCount = 0
+        self._lastNBuffer.clear()
+
+    def flushCallLimit(self) -> None:
+        """Flush the buffered output from limitLast mode.
+
+        When limitLast is configured, ic() calls are buffered instead of being
+        printed immediately. Call this method to print all buffered output
+        (the last N calls). After flushing, the buffer is cleared.
+
+        If limitLast is not configured, this method does nothing.
+        """
+        if self._limitLast is not None and self._lastNBuffer:
+            for out, indentLevel in self._lastNBuffer:
+                self.outputFunction(out)
+                self._outputCount += 1
+            self._lastNBuffer.clear()
+
     def configureOutput(
         self: "IceCreamDebugger",
         prefix: Union[str, Literal[Sentinel.absent]] = Sentinel.absent,
@@ -603,7 +688,10 @@ class IceCreamDebugger:
         contextAbsPath: Union[bool, Literal[Sentinel.absent]] = Sentinel.absent,
         lineWrapWidth: Union[bool, Literal[Sentinel.absent]] = Sentinel.absent,
         enableIndentation: Union[bool, Literal[Sentinel.absent]] = Sentinel.absent,
-        indentationStr: Union[str, Literal[Sentinel.absent]] = Sentinel.absent
+        indentationStr: Union[str, Literal[Sentinel.absent]] = Sentinel.absent,
+        limitFirst: Union[Optional[int], Literal[Sentinel.absent]] = Sentinel.absent,
+        limitLast: Union[Optional[int], Literal[Sentinel.absent]] = Sentinel.absent,
+        limitEvery: Union[Optional[int], Literal[Sentinel.absent]] = Sentinel.absent
     ) -> None:
         """Configure ic() output settings.
 
@@ -628,6 +716,55 @@ class IceCreamDebugger:
                 Default is False.
             indentationStr: String used for each level of indentation when
                 enableIndentation is True. Default is 4 spaces ('    ').
+            limitFirst: If set to a positive integer N, only the first N ic()
+                calls will produce output. Subsequent calls are counted but
+                suppressed. Set to None to disable. Default is None.
+
+                Use case: When debugging loops or recursive functions, you often
+                want to see the initial behavior without being overwhelmed by
+                thousands of outputs. For example, when debugging a loop that
+                processes 10,000 items, setting limitFirst=10 lets you verify
+                the first few iterations work correctly before the output
+                becomes unmanageable. This is also useful for recursive functions
+                where you want to track entry into the recursion but don't need
+                to see every single call.
+
+            limitLast: If set to a positive integer N, only the last N ic()
+                calls will produce output. All calls are buffered, and only
+                the last N are printed when flushCallLimit() is called.
+                Set to None to disable. Default is None.
+
+                Use case: When you need to understand how a long-running process
+                ended up in a particular state, the final calls are often most
+                relevant. For example, when debugging why a recursive algorithm
+                returned an unexpected result, seeing the last 10 ic() calls
+                shows you the final steps that led to that result. This is
+                particularly useful for debugging convergence issues, final
+                state problems, or understanding the exit path of complex
+                algorithms. Remember to call flushCallLimit() after your code
+                runs to see the buffered output.
+
+            limitEvery: If set to a positive integer N, only every Nth ic()
+                call will produce output (1st, N+1th, 2N+1th, etc.).
+                Set to None to disable. Default is None.
+
+                Use case: When you want to see the "big picture" of how a loop
+                or recursive function progresses without reading every single
+                call. For example, when debugging a loop that processes 1,000
+                items, setting limitEvery=100 shows you calls 1, 101, 201, etc.,
+                giving you 10 evenly-spaced snapshots of the execution. This
+                helps identify trends, patterns, or the point where behavior
+                changes without wading through excessive output.
+
+        Note:
+            - limitFirst and limitEvery can be combined: output appears for
+              calls that satisfy BOTH conditions. For example, limitFirst=50
+              with limitEvery=10 shows calls 1, 11, 21, 31, 41 (every 10th
+              call within the first 50).
+            - limitLast operates independently and buffers output until
+              flushCallLimit() is called.
+            - Use resetCallLimit() to reset call counters and clear buffers
+              when starting a new debugging session.
 
         Raises:
             TypeError: If no arguments are provided.
@@ -653,6 +790,28 @@ class IceCreamDebugger:
 
             # Reset baseline for new debugging session
             ic.resetIndentation()
+
+            # Debug a loop: see only first 5 iterations to verify initial behavior
+            ic.configureOutput(limitFirst=5)
+            ic.resetCallLimit()
+            for i in range(1000):
+                ic(i)  # Only shows i=0,1,2,3,4
+
+            # Debug a loop: see every 100th call to track overall progress
+            ic.configureOutput(limitFirst=None, limitEvery=100)
+            ic.resetCallLimit()
+            for i in range(1000):
+                ic(i)  # Shows i=0,100,200,...,900
+
+            # Debug to see final state: buffer all calls, show last 10
+            ic.configureOutput(limitEvery=None, limitLast=10)
+            ic.resetCallLimit()
+            for i in range(1000):
+                ic(i)  # All buffered
+            ic.flushCallLimit()  # Prints i=990,991,...,999
+
+            # Reset counters for new debugging session
+            ic.resetCallLimit()
         """
         noParameterProvided = all(
             v is Sentinel.absent for k, v in locals().items() if k != 'self')
@@ -682,6 +841,17 @@ class IceCreamDebugger:
 
         if indentationStr is not Sentinel.absent:
             self.indentationStr = indentationStr
+
+        if limitFirst is not Sentinel.absent:
+            self._limitFirst = limitFirst
+
+        if limitLast is not Sentinel.absent:
+            self._limitLast = limitLast
+            # Clear the buffer when limitLast changes
+            self._lastNBuffer.clear()
+
+        if limitEvery is not Sentinel.absent:
+            self._limitEvery = limitEvery
 
     def configureSensitiveKeys(
         self,
@@ -771,6 +941,31 @@ class IceCreamDebugger:
     def sensitivePlaceholder(self) -> str:
         """Get the current placeholder string for masked values."""
         return self._sensitivePlaceholder
+
+    @property
+    def callCount(self) -> int:
+        """Get the current call count since last reset."""
+        return self._callCount
+
+    @property
+    def outputCount(self) -> int:
+        """Get the number of calls that produced output since last reset."""
+        return self._outputCount
+
+    @property
+    def limitFirst(self) -> Optional[int]:
+        """Get the current limitFirst setting."""
+        return self._limitFirst
+
+    @property
+    def limitLast(self) -> Optional[int]:
+        """Get the current limitLast setting."""
+        return self._limitLast
+
+    @property
+    def limitEvery(self) -> Optional[int]:
+        """Get the current limitEvery setting."""
+        return self._limitEvery
 
 
 ic = IceCreamDebugger()

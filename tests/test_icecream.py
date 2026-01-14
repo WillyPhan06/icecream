@@ -1279,3 +1279,758 @@ class TestSensitiveKeyHelpers(unittest.TestCase):
         data = {'public': 'visible', 'count': 42, 'active': True}
         result = _mask_sensitive_value(data, {'password'}, '***')
         self.assertEqual(result, data)
+
+
+class TestCallLimiting(unittest.TestCase):
+    """Tests for the call limiting feature."""
+
+    def setUp(self):
+        ic._pairDelimiter = TEST_PAIR_DELIMITER
+        # Reset all call limit settings
+        ic.configureOutput(limitFirst=None, limitLast=None, limitEvery=None)
+        ic.resetCallLimit()
+
+    def tearDown(self):
+        # Reset to default state
+        ic.configureOutput(limitFirst=None, limitLast=None, limitEvery=None)
+        ic.resetCallLimit()
+
+    def test_no_limits_by_default(self):
+        """By default, no limits should be set."""
+        self.assertIsNone(ic.limitFirst)
+        self.assertIsNone(ic.limitLast)
+        self.assertIsNone(ic.limitEvery)
+
+    def test_call_count_increments(self):
+        """Call count should increment with each ic() call."""
+        ic.resetCallLimit()
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(a)
+            ic(b)
+            ic(c)
+        self.assertEqual(ic.callCount, 3)
+
+    def test_output_count_tracks_outputs(self):
+        """Output count should track how many calls produced output."""
+        ic.resetCallLimit()
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(a)
+            ic(b)
+        self.assertEqual(ic.outputCount, 2)
+
+    def test_limit_first_shows_only_first_n(self):
+        """limitFirst=N should only show the first N ic() calls."""
+        ic.configureOutput(limitFirst=2)
+        ic.resetCallLimit()
+
+        outputs = []
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)  # Should output
+            ic(2)  # Should output
+            ic(3)  # Should be suppressed
+            ic(4)  # Should be suppressed
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+        self.assertIn('1', lines[0])
+        self.assertIn('2', lines[1])
+        self.assertEqual(ic.callCount, 4)
+        self.assertEqual(ic.outputCount, 2)
+
+    def test_limit_first_zero_suppresses_all(self):
+        """limitFirst=0 should suppress all output."""
+        ic.configureOutput(limitFirst=0)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)
+            ic(2)
+            ic(3)
+
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(ic.callCount, 3)
+        self.assertEqual(ic.outputCount, 0)
+
+    def test_limit_every_shows_every_nth(self):
+        """limitEvery=N should show every Nth call (1st, N+1th, 2N+1th, ...)."""
+        ic.configureOutput(limitEvery=3)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)  # Call 1: output (1st)
+            ic(2)  # Call 2: suppress
+            ic(3)  # Call 3: suppress
+            ic(4)  # Call 4: output (3+1=4th)
+            ic(5)  # Call 5: suppress
+            ic(6)  # Call 6: suppress
+            ic(7)  # Call 7: output (6+1=7th)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 3)
+        self.assertIn('1', lines[0])
+        self.assertIn('4', lines[1])
+        self.assertIn('7', lines[2])
+        self.assertEqual(ic.callCount, 7)
+        self.assertEqual(ic.outputCount, 3)
+
+    def test_limit_every_one_shows_all(self):
+        """limitEvery=1 should show all calls."""
+        ic.configureOutput(limitEvery=1)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)
+            ic(2)
+            ic(3)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(ic.outputCount, 3)
+
+    def test_limit_first_and_every_combined(self):
+        """limitFirst and limitEvery can be combined (both conditions must be met)."""
+        ic.configureOutput(limitFirst=5, limitEvery=2)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)  # Call 1: matches every=2 (1st), within first=5 -> output
+            ic(2)  # Call 2: doesn't match every=2 -> suppress
+            ic(3)  # Call 3: matches every=2 (3rd), within first=5 -> output
+            ic(4)  # Call 4: doesn't match every=2 -> suppress
+            ic(5)  # Call 5: matches every=2 (5th), within first=5 -> output
+            ic(6)  # Call 6: exceeds first=5 -> suppress
+            ic(7)  # Call 7: exceeds first=5 -> suppress
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 3)
+        self.assertIn('1', lines[0])
+        self.assertIn('3', lines[1])
+        self.assertIn('5', lines[2])
+
+    def test_limit_last_buffers_output(self):
+        """limitLast=N should buffer calls and only flush last N."""
+        ic.configureOutput(limitLast=2)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)  # Buffered, then dropped
+            ic(2)  # Buffered, then dropped
+            ic(3)  # Buffered, kept
+            ic(4)  # Buffered, kept
+
+        # Nothing should be output yet
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(ic.callCount, 4)
+
+        # Now flush
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+        self.assertIn('3', lines[0])
+        self.assertIn('4', lines[1])
+
+    def test_limit_last_with_fewer_calls_than_limit(self):
+        """limitLast=N with fewer than N calls should show all calls on flush."""
+        ic.configureOutput(limitLast=5)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)
+            ic(2)
+
+        # Flush
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+
+    def test_reset_call_limit_clears_counters(self):
+        """resetCallLimit() should clear counters and buffer."""
+        ic.configureOutput(limitLast=5)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)
+            ic(2)
+
+        self.assertEqual(ic.callCount, 2)
+
+        ic.resetCallLimit()
+
+        self.assertEqual(ic.callCount, 0)
+        self.assertEqual(ic.outputCount, 0)
+
+        # Buffer should also be cleared
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        self.assertEqual(err.getvalue(), '')
+
+    def test_flush_clears_buffer(self):
+        """flushCallLimit() should clear the buffer after flushing."""
+        ic.configureOutput(limitLast=3)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)
+            ic(2)
+
+        # First flush
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        lines = err.getvalue().strip().split('\n')
+        self.assertEqual(len([l for l in lines if l.strip()]), 2)
+
+        # Second flush should produce nothing (buffer cleared)
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        self.assertEqual(err.getvalue(), '')
+
+    def test_limit_none_disables_limit(self):
+        """Setting limit to None should disable that limit."""
+        ic.configureOutput(limitFirst=2)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)
+            ic(2)
+            ic(3)
+
+        self.assertEqual(ic.outputCount, 2)
+
+        # Disable the limit
+        ic.configureOutput(limitFirst=None)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)
+            ic(2)
+            ic(3)
+
+        self.assertEqual(ic.outputCount, 3)
+
+    def test_call_counting_with_disabled_ic(self):
+        """Call count should not increment when ic is disabled."""
+        ic.resetCallLimit()
+        ic.disable()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)
+            ic(2)
+
+        self.assertEqual(ic.callCount, 0)
+
+        ic.enable()
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(3)
+
+        self.assertEqual(ic.callCount, 1)
+
+    def test_limit_first_with_indentation(self):
+        """limitFirst should work correctly with indentation enabled."""
+        ic.configureOutput(enableIndentation=True, limitFirst=2)
+        ic.resetIndentation()
+        ic.resetCallLimit()
+
+        def inner():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(b)
+            return err.getvalue()
+
+        def outer():
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(a)
+            result1 = err.getvalue()
+            result2 = inner()
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(c)  # This should be suppressed (3rd call)
+            result3 = err.getvalue()
+            return result1, result2, result3
+
+        r1, r2, r3 = outer()
+
+        # First two calls should have output
+        self.assertIn('ic|', r1)
+        self.assertIn('ic|', r2)
+        # Third call should be suppressed
+        self.assertEqual(r3, '')
+        self.assertEqual(ic.callCount, 3)
+        self.assertEqual(ic.outputCount, 2)
+
+        # Reset
+        ic.configureOutput(enableIndentation=False)
+
+    def test_limit_last_with_indentation(self):
+        """limitLast should preserve indentation in buffered output."""
+        ic.configureOutput(enableIndentation=True, limitLast=2)
+        ic.resetIndentation()
+        ic.resetCallLimit()
+
+        def inner():
+            ic(b)
+
+        def outer():
+            ic(a)  # Call 1 - baseline (no indent)
+            inner()  # Call 2 - one level deep (indented)
+            ic(c)  # Call 3 - back to baseline (no indent)
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            outer()
+
+        # Nothing should be output yet (buffered)
+        self.assertEqual(err.getvalue(), '')
+
+        # Flush and check
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        output = err.getvalue()
+        lines = output.strip().split('\n')
+        # Should have last 2 calls (inner's ic(b) and ic(c))
+        # The indentation should be preserved
+        self.assertEqual(len([l for l in lines if l.strip()]), 2)
+
+        # First buffered line should be from inner() - indented
+        self.assertTrue(lines[0].startswith('    '),
+                       f"Expected inner() call to be indented, got: '{lines[0]}'")
+        self.assertIn('b', lines[0])
+
+        # Second buffered line should be from outer()'s second ic(c) - not indented
+        self.assertFalse(lines[1].startswith('    '),
+                        f"Expected outer() call to not be indented, got: '{lines[1]}'")
+        self.assertIn('c', lines[1])
+
+        # Reset
+        ic.configureOutput(enableIndentation=False)
+
+    def test_limit_last_with_deep_nesting_preserves_indentation(self):
+        """limitLast should correctly preserve multiple indentation levels."""
+        ic.configureOutput(enableIndentation=True, limitLast=4)
+        ic.resetIndentation()
+        ic.resetCallLimit()
+
+        def level3():
+            ic('L3')  # 3 levels deep
+
+        def level2():
+            ic('L2')  # 2 levels deep
+            level3()
+
+        def level1():
+            ic('L1')  # 1 level deep
+            level2()
+
+        def level0():
+            ic('L0')  # baseline
+            level1()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            level0()
+
+        # Nothing should be output yet
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(ic.callCount, 4)
+
+        # Flush and verify indentation levels
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        output = err.getvalue()
+        lines = output.strip().split('\n')
+        self.assertEqual(len([l for l in lines if l.strip()]), 4)
+
+        # L0 - baseline (no indentation)
+        self.assertFalse(lines[0].startswith(' '),
+                        f"L0 should have no indentation: '{lines[0]}'")
+        self.assertIn('L0', lines[0])
+
+        # L1 - 1 level (4 spaces)
+        self.assertTrue(lines[1].startswith('    ') and not lines[1].startswith('        '),
+                       f"L1 should have 1 level indentation: '{lines[1]}'")
+        self.assertIn('L1', lines[1])
+
+        # L2 - 2 levels (8 spaces)
+        self.assertTrue(lines[2].startswith('        ') and not lines[2].startswith('            '),
+                       f"L2 should have 2 levels indentation: '{lines[2]}'")
+        self.assertIn('L2', lines[2])
+
+        # L3 - 3 levels (12 spaces)
+        self.assertTrue(lines[3].startswith('            '),
+                       f"L3 should have 3 levels indentation: '{lines[3]}'")
+        self.assertIn('L3', lines[3])
+
+        # Reset
+        ic.configureOutput(enableIndentation=False)
+
+    def test_limit_last_with_recursive_preserves_indentation(self):
+        """limitLast should preserve indentation in recursive calls."""
+        ic.configureOutput(enableIndentation=True, limitLast=3)
+        ic.resetIndentation()
+        ic.resetCallLimit()
+
+        def recursive(n):
+            ic(n)
+            if n > 0:
+                recursive(n - 1)
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            recursive(4)  # Makes 5 calls (n=4,3,2,1,0)
+
+        # Nothing output yet
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(ic.callCount, 5)
+
+        # Flush - should show last 3 calls (n=2,1,0) with increasing indentation
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        output = err.getvalue()
+        lines = output.strip().split('\n')
+        self.assertEqual(len([l for l in lines if l.strip()]), 3)
+
+        # The last 3 calls are at depths 2, 3, 4 relative to baseline
+        # n=2 at depth 2 (8 spaces)
+        self.assertTrue(lines[0].startswith('        '),
+                       f"n=2 should have 2 levels indentation: '{lines[0]}'")
+        self.assertIn('2', lines[0])
+
+        # n=1 at depth 3 (12 spaces)
+        self.assertTrue(lines[1].startswith('            '),
+                       f"n=1 should have 3 levels indentation: '{lines[1]}'")
+        self.assertIn('1', lines[1])
+
+        # n=0 at depth 4 (16 spaces)
+        self.assertTrue(lines[2].startswith('                '),
+                       f"n=0 should have 4 levels indentation: '{lines[2]}'")
+        self.assertIn('0', lines[2])
+
+        # Reset
+        ic.configureOutput(enableIndentation=False)
+
+    def test_limit_last_with_custom_indentation_string(self):
+        """limitLast should preserve custom indentation strings."""
+        ic.configureOutput(enableIndentation=True, indentationStr='>>',  limitLast=2)
+        ic.resetIndentation()
+        ic.resetCallLimit()
+
+        def inner():
+            ic('inner')
+
+        def outer():
+            ic('outer')
+            inner()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            outer()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        output = err.getvalue()
+        lines = output.strip().split('\n')
+
+        # outer() call - no indentation
+        self.assertFalse(lines[0].startswith('>>'),
+                        f"outer() should have no indentation: '{lines[0]}'")
+
+        # inner() call - custom indentation '>>'
+        self.assertTrue(lines[1].startswith('>>'),
+                       f"inner() should start with '>>': '{lines[1]}'")
+        self.assertFalse(lines[1].startswith('>>>>'),
+                        f"inner() should only have 1 level: '{lines[1]}'")
+
+        # Reset
+        ic.configureOutput(enableIndentation=False, indentationStr='    ')
+
+    def test_properties_reflect_configuration(self):
+        """Property accessors should reflect current configuration."""
+        ic.configureOutput(limitFirst=10, limitLast=5, limitEvery=2)
+
+        self.assertEqual(ic.limitFirst, 10)
+        self.assertEqual(ic.limitLast, 5)
+        self.assertEqual(ic.limitEvery, 2)
+
+        ic.configureOutput(limitFirst=None, limitLast=None, limitEvery=None)
+
+        self.assertIsNone(ic.limitFirst)
+        self.assertIsNone(ic.limitLast)
+        self.assertIsNone(ic.limitEvery)
+
+    def test_limit_every_large_value(self):
+        """limitEvery with large value should work correctly."""
+        ic.configureOutput(limitEvery=100)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            for i in range(10):
+                ic(i)
+
+        # Only the first call (call 1) should output
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertIn('0', lines[0])
+
+    def test_recursive_function_with_limit_first(self):
+        """limitFirst should work with recursive functions."""
+        ic.configureOutput(limitFirst=3)
+        ic.resetCallLimit()
+
+        def recursive(n):
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(n)
+            result = err.getvalue()
+            if n > 0:
+                recursive(n - 1)
+            return result
+
+        # This will make 6 calls (n=5,4,3,2,1,0)
+        outputs = []
+
+        def capture_recursive(n):
+            if n >= 0:
+                with disable_coloring(), capture_standard_streams() as (out, err):
+                    ic(n)
+                outputs.append(err.getvalue())
+                capture_recursive(n - 1)
+
+        capture_recursive(5)
+
+        # Only first 3 should have output
+        non_empty = [o for o in outputs if o.strip()]
+        self.assertEqual(len(non_empty), 3)
+        self.assertEqual(ic.callCount, 6)
+
+    def test_loop_with_limit_every(self):
+        """limitEvery should be useful for loops."""
+        ic.configureOutput(limitEvery=10)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            for i in range(100):
+                ic(i)
+
+        # Should output calls 1, 11, 21, 31, 41, 51, 61, 71, 81, 91 = 10 outputs
+        # (indices 0, 10, 20, 30, 40, 50, 60, 70, 80, 90)
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 10)
+        self.assertEqual(ic.outputCount, 10)
+        self.assertEqual(ic.callCount, 100)
+
+    def test_limit_first_with_include_context(self):
+        """limitFirst should work correctly when includeContext is enabled."""
+        ic.configureOutput(limitFirst=3, includeContext=True)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)  # Call 1 - should output with context
+            ic(2)  # Call 2 - should output with context
+            ic(3)  # Call 3 - should output with context
+            ic(4)  # Call 4 - should be suppressed
+            ic(5)  # Call 5 - should be suppressed
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+
+        # Should have 3 outputs
+        self.assertEqual(ic.callCount, 5)
+        self.assertEqual(ic.outputCount, 3)
+
+        # Each output should include context info (filename and line number)
+        # Context format: "ic| test_icecream.py:XXXX in test_limit_first_with_include_context()"
+        for line in lines:
+            self.assertIn('test_icecream.py:', line,
+                         f"Context should include filename: '{line}'")
+            self.assertIn('in test_limit_first_with_include_context()', line,
+                         f"Context should include function name: '{line}'")
+
+        # Verify values are correct (1, 2, 3)
+        self.assertIn('1', lines[0])
+        self.assertIn('2', lines[1])
+        self.assertIn('3', lines[2])
+
+        # Reset
+        ic.configureOutput(includeContext=False)
+
+    def test_limit_every_with_include_context(self):
+        """limitEvery should work correctly when includeContext is enabled."""
+        ic.configureOutput(limitEvery=3, includeContext=True)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            for i in range(9):
+                ic(i)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+
+        # Should output calls 1, 4, 7 (i=0, 3, 6)
+        self.assertEqual(ic.callCount, 9)
+        self.assertEqual(ic.outputCount, 3)
+
+        # Each output should include context
+        for line in lines:
+            self.assertIn('test_icecream.py:', line)
+
+        # Verify correct values
+        self.assertIn('0', lines[0])
+        self.assertIn('3', lines[1])
+        self.assertIn('6', lines[2])
+
+        # Reset
+        ic.configureOutput(includeContext=False)
+
+    def test_disable_enable_mid_loop_call_counter(self):
+        """Call counter should only count when ic is enabled."""
+        ic.configureOutput(limitFirst=5)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            # First 3 iterations with ic enabled
+            for i in range(3):
+                ic(i)  # Calls 1, 2, 3
+
+            # Disable ic for next 4 iterations
+            ic.disable()
+            for i in range(3, 7):
+                ic(i)  # Should not count (ic disabled)
+
+            # Re-enable ic for remaining iterations
+            ic.enable()
+            for i in range(7, 12):
+                ic(i)  # Calls 4, 5, 6, 7, 8
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+
+        # Call counter: 3 (enabled) + 0 (disabled) + 5 (enabled) = 8
+        self.assertEqual(ic.callCount, 8,
+                        "Call counter should only count enabled calls")
+
+        # With limitFirst=5, should output calls 1-5 (i=0,1,2,7,8)
+        # Calls 6,7,8 (i=9,10,11) should be suppressed
+        self.assertEqual(ic.outputCount, 5,
+                        "Should output only first 5 enabled calls")
+        self.assertEqual(len(lines), 5)
+
+        # Verify the output values: 0, 1, 2 from first batch, then 7, 8 from third batch
+        self.assertIn('0', lines[0])
+        self.assertIn('1', lines[1])
+        self.assertIn('2', lines[2])
+        self.assertIn('7', lines[3])
+        self.assertIn('8', lines[4])
+
+    def test_disable_enable_mid_loop_with_limit_every(self):
+        """limitEvery should correctly track calls across disable/enable cycles."""
+        ic.configureOutput(limitEvery=2)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            # Enabled: calls 1, 2, 3 (outputs 1, 3)
+            ic('a')  # Call 1 - output
+            ic('b')  # Call 2 - skip
+            ic('c')  # Call 3 - output
+
+            # Disabled: no counting
+            ic.disable()
+            ic('x')  # Not counted
+            ic('y')  # Not counted
+
+            # Enabled: calls 4, 5, 6 (outputs 5)
+            ic.enable()
+            ic('d')  # Call 4 - skip
+            ic('e')  # Call 5 - output
+            ic('f')  # Call 6 - skip
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+
+        self.assertEqual(ic.callCount, 6,
+                        "Should count 6 enabled calls")
+        # limitEvery=2: outputs calls 1, 3, 5 (every odd call)
+        self.assertEqual(ic.outputCount, 3)
+        self.assertEqual(len(lines), 3)
+
+        self.assertIn('a', lines[0])
+        self.assertIn('c', lines[1])
+        self.assertIn('e', lines[2])
+
+    def test_disable_enable_with_limit_last(self):
+        """limitLast should only buffer enabled calls."""
+        ic.configureOutput(limitLast=3)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic('a')  # Call 1 - buffered
+            ic('b')  # Call 2 - buffered
+
+            ic.disable()
+            ic('x')  # Not buffered (disabled)
+            ic('y')  # Not buffered (disabled)
+
+            ic.enable()
+            ic('c')  # Call 3 - buffered
+            ic('d')  # Call 4 - buffered (pushes 'a' out)
+            ic('e')  # Call 5 - buffered (pushes 'b' out)
+
+        # Nothing output yet
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(ic.callCount, 5)
+
+        # Flush - should show last 3 enabled calls: c, d, e
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+
+        self.assertEqual(len(lines), 3)
+        self.assertIn('c', lines[0])
+        self.assertIn('d', lines[1])
+        self.assertIn('e', lines[2])
+
+    def test_multiple_disable_enable_cycles(self):
+        """Call counter should work correctly through multiple disable/enable cycles."""
+        ic.configureOutput(limitFirst=None, limitEvery=None)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            # Cycle 1: enabled
+            ic(1)
+            ic(2)
+
+            # Cycle 2: disabled
+            ic.disable()
+            ic(3)
+            ic(4)
+
+            # Cycle 3: enabled
+            ic.enable()
+            ic(5)
+
+            # Cycle 4: disabled
+            ic.disable()
+            ic(6)
+
+            # Cycle 5: enabled
+            ic.enable()
+            ic(7)
+            ic(8)
+            ic(9)
+
+        self.assertEqual(ic.callCount, 6,
+                        "Should count only enabled calls: 1,2,5,7,8,9")
+        self.assertEqual(ic.outputCount, 6,
+                        "With no limits, all enabled calls should output")
