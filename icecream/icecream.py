@@ -561,6 +561,9 @@ class IceCreamDebugger:
         self._enableDiff: bool = False
         self._diffHighlightStyle: str = 'background'  # 'background', 'foreground', or 'underline'
         self._previousOutput: Optional[str] = None  # Store previous ic() output for comparison
+        # Conditional output state
+        self._condition: Optional[Callable[[Any], bool]] = None
+        self._conditionTarget: str = 'any'  # 'any', 'all', or 'first'
 
     def __call__(self, *args: object) -> object:
         if self.enabled:
@@ -588,6 +591,10 @@ class IceCreamDebugger:
 
             # Determine if this call should produce output
             shouldOutput = self._shouldOutput(currentCallNum)
+
+            # Check condition filter if configured
+            if shouldOutput and self._condition is not None and args:
+                shouldOutput = self._checkCondition(args)
 
             # Handle limitLast buffering
             if self._limitLast is not None:
@@ -656,6 +663,45 @@ class IceCreamDebugger:
                 shouldOutput = False
 
         return shouldOutput
+
+    def _checkCondition(self, args: Sequence[object]) -> bool:
+        """Check if any/all arguments satisfy the condition function.
+
+        This method applies the configured condition function to ic() arguments
+        to determine if output should be produced. The conditionTarget setting
+        controls how multiple arguments are handled.
+
+        Args:
+            args: The arguments passed to ic().
+
+        Returns:
+            True if the condition is satisfied (output should be produced),
+            False otherwise.
+        """
+        if self._condition is None:
+            return True
+
+        try:
+            if self._conditionTarget == 'any':
+                # Output if ANY argument satisfies the condition
+                return any(self._condition(arg) for arg in args)
+            elif self._conditionTarget == 'all':
+                # Output only if ALL arguments satisfy the condition
+                return all(self._condition(arg) for arg in args)
+            elif self._conditionTarget == 'first':
+                # Only check the first argument
+                return self._condition(args[0])
+            else:
+                raise ValueError(
+                    f"conditionTarget must be 'any', 'all', or 'first', "
+                    f"got {self._conditionTarget!r}")
+        except ValueError:
+            # Re-raise ValueError for invalid conditionTarget
+            raise
+        except Exception:
+            # If condition function raises an exception, suppress output
+            # This handles cases like type errors when condition expects specific types
+            return False
 
     def format(self, *args: object) -> str:
         currentFrame = inspect.currentframe()
@@ -842,6 +888,14 @@ class IceCreamDebugger:
         """
         self._previousOutput = None
 
+    def resetCondition(self) -> None:
+        """Reset the condition filter to default (no filtering).
+
+        Call this method to disable conditional filtering by clearing the
+        condition function. The conditionTarget setting is preserved.
+        """
+        self._condition = None
+
     def flushCallLimit(self) -> None:
         """Flush the buffered output from limitLast mode.
 
@@ -889,7 +943,9 @@ class IceCreamDebugger:
         logFile: Union[Optional[str], Literal[Sentinel.absent]] = Sentinel.absent,
         logMode: Union[Literal['a', 'w'], Literal[Sentinel.absent]] = Sentinel.absent,
         enableDiff: Union[bool, Literal[Sentinel.absent]] = Sentinel.absent,
-        diffHighlightStyle: Union[Literal['background', 'foreground', 'underline'], Literal[Sentinel.absent]] = Sentinel.absent
+        diffHighlightStyle: Union[Literal['background', 'foreground', 'underline'], Literal[Sentinel.absent]] = Sentinel.absent,
+        condition: Union[Optional[Callable[[Any], bool]], Literal[Sentinel.absent]] = Sentinel.absent,
+        conditionTarget: Union[Literal['any', 'all', 'first'], Literal[Sentinel.absent]] = Sentinel.absent
     ) -> None:
         """Configure ic() output settings.
 
@@ -1005,6 +1061,40 @@ class IceCreamDebugger:
                 with syntax highlighting. 'foreground' is less obtrusive.
                 'underline' is subtle and works well for minor changes.
 
+            condition: A callable that takes a value and returns True/False.
+                When set, ic() will only produce output if the condition is
+                satisfied by the argument value(s). Set to None to disable
+                conditional filtering. Default is None.
+
+                Use case: When debugging loops or complex code, you often want
+                to see ic() output only when values meet certain criteria, such
+                as when a number becomes negative, a value is None, or a variable
+                has a specific type. This eliminates the need to manually scan
+                through thousands of ic() messages to find the ones you care about.
+
+                Common condition functions:
+                - `lambda x: x is None` - only show when value is None
+                - `lambda x: x < 0` - only show negative numbers
+                - `lambda x: isinstance(x, Exception)` - only show exceptions
+                - `lambda x: len(x) > 100` - only show large collections
+                - `lambda x: 'error' in str(x).lower()` - only show error messages
+
+                Note: If the condition function raises an exception (e.g., TypeError
+                when checking `x < 0` on a string), the output is suppressed for
+                that call. This allows type-specific conditions to safely filter
+                out incompatible types.
+
+            conditionTarget: Controls how the condition is applied when ic() is
+                called with multiple arguments. Options are:
+                - 'any': Output if ANY argument satisfies the condition (default)
+                - 'all': Output only if ALL arguments satisfy the condition
+                - 'first': Only check the first argument
+
+                Use case: When debugging with ic(x, y, z), you may want different
+                matching behaviors. Use 'any' to catch any problematic value,
+                'all' for strict filtering, or 'first' to focus on the primary
+                variable of interest.
+
         Note:
             - limitFirst and limitEvery can be combined: output appears for
               calls that satisfy BOTH conditions. For example, limitFirst=50
@@ -1090,6 +1180,39 @@ class IceCreamDebugger:
 
             # Disable diff highlighting
             ic.configureOutput(enableDiff=False)
+
+            # Conditional output: only show ic() when value is None
+            ic.configureOutput(condition=lambda x: x is None)
+            for item in items:
+                ic(item)  # Only outputs when item is None
+
+            # Conditional output: only show ic() when number is negative
+            ic.configureOutput(condition=lambda x: x < 0)
+            for i in range(-5, 5):
+                ic(i)  # Only shows -5, -4, -3, -2, -1
+
+            # Conditional output: only show ic() for specific types
+            ic.configureOutput(condition=lambda x: isinstance(x, dict))
+            for item in mixed_list:
+                ic(item)  # Only outputs dict items
+
+            # Multiple arguments with 'any' (default): output if ANY matches
+            ic.configureOutput(condition=lambda x: x < 0, conditionTarget='any')
+            ic(a, b, c)  # Outputs if a, b, OR c is negative
+
+            # Multiple arguments with 'all': output only if ALL match
+            ic.configureOutput(conditionTarget='all')
+            ic(a, b, c)  # Outputs only if a, b, AND c are all negative
+
+            # Multiple arguments with 'first': only check first argument
+            ic.configureOutput(conditionTarget='first')
+            ic(primary, secondary)  # Only checks 'primary'
+
+            # Reset condition filter
+            ic.resetCondition()
+
+            # Disable conditional filtering
+            ic.configureOutput(condition=None)
         """
         noParameterProvided = all(
             v is Sentinel.absent for k, v in locals().items() if k != 'self')
@@ -1161,6 +1284,16 @@ class IceCreamDebugger:
                     f"diffHighlightStyle must be 'background', 'foreground', or 'underline', "
                     f"got {diffHighlightStyle!r}")
             self._diffHighlightStyle = diffHighlightStyle
+
+        if condition is not Sentinel.absent:
+            self._condition = condition
+
+        if conditionTarget is not Sentinel.absent:
+            if conditionTarget not in ('any', 'all', 'first'):
+                raise ValueError(
+                    f"conditionTarget must be 'any', 'all', or 'first', "
+                    f"got {conditionTarget!r}")
+            self._conditionTarget = conditionTarget
 
     def configureSensitiveKeys(
         self,
@@ -1300,6 +1433,16 @@ class IceCreamDebugger:
     def diffHighlightStyle(self) -> str:
         """Get the current diff highlight style ('background', 'foreground', or 'underline')."""
         return self._diffHighlightStyle
+
+    @property
+    def condition(self) -> Optional[Callable[[Any], bool]]:
+        """Get the current condition function, or None if not set."""
+        return self._condition
+
+    @property
+    def conditionTarget(self) -> str:
+        """Get the current conditionTarget setting ('any', 'all', or 'first')."""
+        return self._conditionTarget
 
     def _writeToLogFile(self, s: str) -> None:
         """Write output to the log file if logging is enabled.

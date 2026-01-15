@@ -2919,3 +2919,533 @@ class TestDiffWithOtherFeatures(unittest.TestCase):
         self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, result)
         # The diff should be based on content: "red" vs "green" and "1" vs "2"
         self.assertIn('2', result)  # The changed value should be present
+
+
+class TestCondition(unittest.TestCase):
+    """Tests for ic() conditional output filtering."""
+
+    def setUp(self):
+        ic.resetCondition()
+        ic.configureOutput(conditionTarget='any')
+
+    def tearDown(self):
+        ic.resetCondition()
+        ic.configureOutput(conditionTarget='any')
+
+    def test_no_condition_by_default(self):
+        """By default, no condition should be set."""
+        self.assertIsNone(ic.condition)
+        self.assertEqual(ic.conditionTarget, 'any')
+
+    def test_reset_condition_shows_all(self):
+        """resetCondition() should clear filtering and show all ic() calls."""
+        ic.configureOutput(condition=lambda x: x < 0)
+        ic.resetCondition()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)
+            ic(2)
+            ic(-1)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 3)
+
+    def test_condition_filters_output(self):
+        """condition should filter ic() output based on the function result."""
+        ic.configureOutput(condition=lambda x: x < 0)
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(5)    # Should be suppressed (5 >= 0)
+            ic(-3)   # Should output (-3 < 0)
+            ic(0)    # Should be suppressed (0 >= 0)
+            ic(-10)  # Should output (-10 < 0)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+        self.assertIn('-3', lines[0])
+        self.assertIn('-10', lines[1])
+
+    def test_condition_is_none_check(self):
+        """condition can check for None values."""
+        ic.configureOutput(condition=lambda x: x is None)
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic("hello")  # Should be suppressed
+            ic(None)     # Should output
+            ic(0)        # Should be suppressed (0 is not None)
+            ic(None)     # Should output
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+
+    def test_condition_isinstance_check(self):
+        """condition can check for specific types."""
+        ic.configureOutput(condition=lambda x: isinstance(x, dict))
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic([1, 2, 3])        # Should be suppressed (list)
+            ic({'a': 1})         # Should output (dict)
+            ic("string")         # Should be suppressed (str)
+            ic({'b': 2, 'c': 3}) # Should output (dict)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("'a'", lines[0])
+        self.assertIn("'b'", lines[1])
+
+    def test_condition_string_contains(self):
+        """condition can check string contents."""
+        ic.configureOutput(condition=lambda x: 'error' in str(x).lower())
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic("Success!")          # Should be suppressed
+            ic("Error occurred")    # Should output
+            ic("All good")          # Should be suppressed
+            ic("ERROR: failed")     # Should output (case insensitive)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+        self.assertIn('Error occurred', lines[0])
+        self.assertIn('ERROR', lines[1])
+
+    def test_condition_length_check(self):
+        """condition can check collection length."""
+        ic.configureOutput(condition=lambda x: len(x) > 2)
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic([1])              # Should be suppressed (len=1)
+            ic([1, 2])           # Should be suppressed (len=2)
+            ic([1, 2, 3])        # Should output (len=3)
+            ic([1, 2, 3, 4, 5])  # Should output (len=5)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+
+    def test_condition_exception_suppresses_output(self):
+        """If condition raises an exception, output should be suppressed."""
+        # This condition will raise TypeError for non-numeric types
+        ic.configureOutput(condition=lambda x: x < 0)
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic("string")  # Should be suppressed (TypeError on comparison)
+            ic(-5)        # Should output
+            ic([1, 2])    # Should be suppressed (TypeError on comparison)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertIn('-5', lines[0])
+
+    def test_condition_target_any_default(self):
+        """conditionTarget='any' (default) outputs if ANY argument matches."""
+        ic.configureOutput(condition=lambda x: x < 0, conditionTarget='any')
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1, 2, 3)       # Should be suppressed (none negative)
+            ic(1, -2, 3)      # Should output (-2 is negative)
+            ic(-1, -2, -3)    # Should output (all negative)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+
+    def test_condition_target_all(self):
+        """conditionTarget='all' outputs only if ALL arguments match."""
+        ic.configureOutput(condition=lambda x: x < 0, conditionTarget='all')
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1, 2, 3)       # Should be suppressed (none negative)
+            ic(1, -2, 3)      # Should be suppressed (not all negative)
+            ic(-1, -2, -3)    # Should output (all negative)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertIn('-1', lines[0])
+        self.assertIn('-2', lines[0])
+        self.assertIn('-3', lines[0])
+
+    def test_condition_target_first(self):
+        """conditionTarget='first' only checks the first argument."""
+        ic.configureOutput(condition=lambda x: x < 0, conditionTarget='first')
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1, -2, -3)     # Should be suppressed (first is positive)
+            ic(-1, 2, 3)      # Should output (first is negative)
+            ic(-5, -6, -7)    # Should output (first is negative)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+
+    def test_condition_target_invalid_value_raises(self):
+        """Invalid conditionTarget value should raise ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            ic.configureOutput(conditionTarget='invalid')
+        self.assertIn("conditionTarget must be 'any', 'all', or 'first'", str(ctx.exception))
+
+    def test_condition_with_no_args(self):
+        """condition should not affect ic() calls with no arguments."""
+        ic.configureOutput(condition=lambda x: x < 0)
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic()  # Should still output (no args to check)
+
+        output = err.getvalue()
+        # ic() with no args outputs timestamp, so it should have content
+        self.assertTrue(len(output.strip()) > 0)
+
+    def test_condition_combined_with_limit_first(self):
+        """condition can be combined with limitFirst."""
+        ic.configureOutput(condition=lambda x: x < 0, limitFirst=3)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(-1)   # Call 1: condition met, within first 3 -> output
+            ic(2)    # Call 2: condition NOT met -> suppress
+            ic(-3)   # Call 3: condition met, within first 3 -> output
+            ic(-4)   # Call 4: condition met, but exceeds first 3 -> suppress
+            ic(-5)   # Call 5: condition met, but exceeds first 3 -> suppress
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+        self.assertIn('-1', lines[0])
+        self.assertIn('-3', lines[1])
+        self.assertEqual(ic.callCount, 5)
+
+    def test_condition_combined_with_limit_every(self):
+        """condition can be combined with limitEvery."""
+        ic.configureOutput(condition=lambda x: x < 0, limitEvery=2, limitFirst=None)
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(-1)   # Call 1: matches every=2, condition met -> output
+            ic(-2)   # Call 2: doesn't match every=2 -> suppress
+            ic(-3)   # Call 3: matches every=2, condition met -> output
+            ic(4)    # Call 4: doesn't match every=2 -> suppress
+            ic(-5)   # Call 5: matches every=2, condition met -> output
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 3)
+        self.assertIn('-1', lines[0])
+        self.assertIn('-3', lines[1])
+        self.assertIn('-5', lines[2])
+
+    def test_reset_condition(self):
+        """resetCondition() should clear the condition function."""
+        ic.configureOutput(condition=lambda x: x < 0)
+        self.assertIsNotNone(ic.condition)
+
+        ic.resetCondition()
+        self.assertIsNone(ic.condition)
+
+        # After reset, all values should output
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(1)
+            ic(-1)
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+
+    def test_reset_condition_preserves_target(self):
+        """resetCondition() should preserve conditionTarget setting."""
+        ic.configureOutput(condition=lambda x: x < 0, conditionTarget='all')
+        self.assertEqual(ic.conditionTarget, 'all')
+
+        ic.resetCondition()
+        self.assertEqual(ic.conditionTarget, 'all')  # Should be preserved
+
+    def test_condition_property(self):
+        """condition property should return the current condition function."""
+        self.assertIsNone(ic.condition)
+
+        my_condition = lambda x: x is None
+        ic.configureOutput(condition=my_condition)
+        self.assertEqual(ic.condition, my_condition)
+
+    def test_condition_target_property(self):
+        """conditionTarget property should return the current target setting."""
+        self.assertEqual(ic.conditionTarget, 'any')
+
+        ic.configureOutput(conditionTarget='all')
+        self.assertEqual(ic.conditionTarget, 'all')
+
+        ic.configureOutput(conditionTarget='first')
+        self.assertEqual(ic.conditionTarget, 'first')
+
+    def test_condition_passthrough_returns_value(self):
+        """ic() should still return the passthrough value when condition filters."""
+        ic.configureOutput(condition=lambda x: x < 0)
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            result = ic(5)  # Filtered, but should still return 5
+
+        self.assertEqual(result, 5)
+
+    def test_condition_passthrough_multiple_args(self):
+        """ic() should still return tuple when multiple args are filtered."""
+        ic.configureOutput(condition=lambda x: x < 0)
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            result = ic(1, 2, 3)  # Filtered, but should still return (1, 2, 3)
+
+        self.assertEqual(result, (1, 2, 3))
+
+    def test_condition_complex_objects(self):
+        """condition should work with complex objects."""
+        class Item:
+            def __init__(self, status):
+                self.status = status
+
+        ic.configureOutput(condition=lambda x: getattr(x, 'status', None) == 'error')
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(Item('ok'))      # Should be suppressed
+            ic(Item('error'))   # Should output
+            ic(Item('pending')) # Should be suppressed
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertIn('error', lines[0])
+
+    def test_condition_with_exception_type(self):
+        """condition can filter for exception types."""
+        ic.configureOutput(condition=lambda x: isinstance(x, Exception))
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic("normal string")      # Should be suppressed
+            ic(ValueError("error"))  # Should output
+            ic(42)                   # Should be suppressed
+            ic(TypeError("type"))    # Should output
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+
+    def test_condition_callable_returning_truthy(self):
+        """condition should work with any truthy/falsy return value."""
+        # Return non-boolean truthy values
+        ic.configureOutput(condition=lambda x: x if isinstance(x, str) else 0)
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic("hello")   # Returns "hello" (truthy) -> output
+            ic("")        # Returns "" (falsy) -> suppress
+            ic(123)       # Returns 0 (falsy) -> suppress
+            ic("world")   # Returns "world" (truthy) -> output
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+
+    def test_condition_with_diff_highlighting(self):
+        """condition should work together with diff highlighting."""
+        ic.configureOutput(
+            condition=lambda x: x < 0,
+            enableDiff=True
+        )
+        ic.resetDiff()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(-1)   # First negative - no diff
+            ic(5)    # Filtered out
+            ic(-2)   # Second negative - should diff against -1
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+
+        # Reset for other tests
+        ic.configureOutput(enableDiff=False)
+
+    def test_condition_single_arg(self):
+        """condition should work correctly with single argument."""
+        ic.configureOutput(condition=lambda x: x > 10, conditionTarget='any')
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic(5)    # Should be suppressed
+            ic(15)   # Should output
+            ic(8)    # Should be suppressed
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertIn('15', lines[0])
+
+    def test_invalid_condition_target_in_check_raises_error(self):
+        """Invalid _conditionTarget value during check should raise ValueError."""
+        ic.configureOutput(condition=lambda x: x < 0)
+        # Bypass validation by directly setting invalid value
+        ic._conditionTarget = 'invalid_target'
+
+        with self.assertRaises(ValueError) as ctx:
+            with disable_coloring(), capture_standard_streams() as (out, err):
+                ic(-5)  # Should raise ValueError due to invalid conditionTarget
+
+        self.assertIn("conditionTarget must be 'any', 'all', or 'first'", str(ctx.exception))
+        self.assertIn("'invalid_target'", str(ctx.exception))
+
+        # Reset to valid value
+        ic._conditionTarget = 'any'
+
+    def test_condition_with_limit_first_and_sensitive_keys(self):
+        """condition should work with limitFirst and sensitiveKeys combined."""
+        ic.configureOutput(
+            condition=lambda x: isinstance(x, dict),
+            limitFirst=3
+        )
+        ic.configureSensitiveKeys(keys=['password', 'secret'])
+        ic.resetCallLimit()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic({'user': 'alice', 'password': 'secret123'})  # Call 1: dict, outputs (masked)
+            ic("string value")                              # Call 2: not dict, suppressed
+            ic({'api_key': 'abc', 'secret': 'xyz'})         # Call 3: dict, outputs (masked)
+            ic({'public': 'data'})                          # Call 4: dict but exceeds limit
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+        # Verify sensitive keys are masked
+        self.assertIn('***MASKED***', lines[0])
+        self.assertIn('***MASKED***', lines[1])
+        # Verify actual values are NOT present
+        self.assertNotIn('secret123', output)
+        self.assertNotIn('xyz', output)
+        self.assertEqual(ic.callCount, 4)
+
+        # Cleanup
+        ic.configureSensitiveKeys(clear=True)
+
+    def test_condition_with_include_context(self):
+        """condition should work with includeContext enabled."""
+        ic.configureOutput(
+            condition=lambda x: x is None,
+            includeContext=True
+        )
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic("not none")  # Should be suppressed
+            ic(None)        # Should output with context
+            ic(42)          # Should be suppressed
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 1)
+        # Verify context is included (filename:line in function)
+        self.assertIn('test_icecream.py:', lines[0])
+        self.assertIn('in test_condition_with_include_context', lines[0])
+
+        # Cleanup
+        ic.configureOutput(includeContext=False)
+
+    def test_condition_with_indentation(self):
+        """condition should work with indentation enabled."""
+        ic.configureOutput(
+            condition=lambda x: x < 0,
+            enableIndentation=True
+        )
+        ic.resetIndentation()
+
+        def outer():
+            ic(-1)  # Baseline level
+            inner()
+
+        def inner():
+            ic(5)   # Should be suppressed (positive)
+            ic(-2)  # Should output with indentation
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            outer()
+
+        output = err.getvalue()
+        lines = output.strip().split('\n')
+        non_empty_lines = [l for l in lines if l.strip()]
+        self.assertEqual(len(non_empty_lines), 2)
+
+        # First line should be at baseline (no leading spaces from indentation)
+        self.assertIn('-1', non_empty_lines[0])
+        # Second line should be indented (inner function is deeper)
+        self.assertIn('-2', non_empty_lines[1])
+        # The second line should have leading indentation
+        self.assertTrue(non_empty_lines[1].startswith('    '))
+
+        # Cleanup
+        ic.configureOutput(enableIndentation=False)
+
+    def test_condition_with_indentation_and_include_context(self):
+        """condition should work with both indentation and includeContext."""
+        ic.configureOutput(
+            condition=lambda x: x < 0,
+            enableIndentation=True,
+            includeContext=True
+        )
+        ic.resetIndentation()
+
+        def level1():
+            ic(-10)  # Baseline
+            level2()
+
+        def level2():
+            ic(100)   # Suppressed (positive)
+            ic(-20)   # Output with indent and context
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            level1()
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+
+        # Both lines should have context info
+        self.assertIn('in level1', lines[0])
+        self.assertIn('in level2', lines[1])
+
+        # Second line should be indented
+        self.assertTrue(lines[1].startswith('    '))
+
+        # Cleanup
+        ic.configureOutput(enableIndentation=False, includeContext=False)
+
+    def test_condition_with_all_features_combined(self):
+        """condition should work with multiple features combined."""
+        ic.configureOutput(
+            condition=lambda x: isinstance(x, dict) and x.get('error'),
+            limitFirst=5,
+            enableIndentation=True,
+            includeContext=True
+        )
+        ic.configureSensitiveKeys(keys=['token'])
+        ic.resetCallLimit()
+        ic.resetIndentation()
+
+        with disable_coloring(), capture_standard_streams() as (out, err):
+            ic({'status': 'ok'})                           # Call 1: no error key
+            ic({'error': True, 'token': 'secret'})         # Call 2: has error, outputs
+            ic("not a dict")                               # Call 3: not a dict
+            ic({'error': False})                           # Call 4: error is False
+            ic({'error': True, 'msg': 'failed'})           # Call 5: has error, outputs
+            ic({'error': True, 'token': 'another'})        # Call 6: exceeds limitFirst
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+        self.assertEqual(len(lines), 2)
+        # Verify sensitive token is masked
+        self.assertIn('***MASKED***', lines[0])
+        self.assertNotIn('secret', output)
+        # Verify context is present
+        self.assertIn('test_icecream.py:', lines[0])
+        self.assertEqual(ic.callCount, 6)
+
+        # Cleanup
+        ic.configureSensitiveKeys(clear=True)
+        ic.configureOutput(enableIndentation=False, includeContext=False)
