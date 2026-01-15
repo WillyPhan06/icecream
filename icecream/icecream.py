@@ -159,6 +159,149 @@ DEFAULT_ARG_TO_STRING_FUNCTION = safe_pformat
 DEFAULT_INDENTATION_STR = '    '  # 4 spaces per level.
 DEFAULT_SENSITIVE_PLACEHOLDER = '***MASKED***'
 
+# ANSI escape codes for diff highlighting
+ANSI_RESET = '\x1b[0m'
+ANSI_DIFF_HIGHLIGHT_BG = '\x1b[43m'  # Yellow background for changes
+ANSI_DIFF_HIGHLIGHT_FG = '\x1b[33m'  # Yellow foreground (less intrusive)
+ANSI_DIFF_UNDERLINE = '\x1b[4m'  # Underline style
+
+
+def _compute_diff_highlights(
+    previous: str,
+    current: str,
+    highlight_style: str = 'background'
+) -> str:
+    """Compute and highlight differences between previous and current output.
+
+    This function compares two ic() output strings and highlights the parts
+    that have changed in the current output. It uses a character-by-character
+    diff algorithm to identify changes at a granular level.
+
+    Note: Any existing ANSI escape codes in the input strings are stripped
+    before comparison to ensure accurate diff detection. The output contains
+    the current string content with diff highlighting applied.
+
+    Args:
+        previous: The previous ic() output string (may contain ANSI codes).
+        current: The current ic() output string (may contain ANSI codes).
+        highlight_style: Style for highlighting differences:
+            - 'background': Yellow background (most visible)
+            - 'foreground': Yellow foreground text (less intrusive)
+            - 'underline': Underlined text (subtle)
+
+    Returns:
+        The current string with differences highlighted using ANSI codes.
+    """
+    if not previous:
+        return current
+
+    # Strip any existing ANSI codes from both strings for clean comparison
+    # This ensures we're comparing actual content, not formatting
+    previous = strip_ansi_codes(previous)
+    current = strip_ansi_codes(current)
+
+    # Select highlight style
+    if highlight_style == 'background':
+        highlight_start = ANSI_DIFF_HIGHLIGHT_BG
+    elif highlight_style == 'foreground':
+        highlight_start = ANSI_DIFF_HIGHLIGHT_FG
+    elif highlight_style == 'underline':
+        highlight_start = ANSI_DIFF_UNDERLINE
+    else:
+        highlight_start = ANSI_DIFF_HIGHLIGHT_BG  # Default to background
+
+    # Use difflib to find differences
+    import difflib
+
+    # Split into lines for line-by-line comparison first
+    prev_lines = previous.splitlines(keepends=True)
+    curr_lines = current.splitlines(keepends=True)
+
+    result_parts = []
+    matcher = difflib.SequenceMatcher(None, prev_lines, curr_lines)
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            # Lines are identical, output as-is
+            result_parts.extend(curr_lines[j1:j2])
+        elif tag == 'replace':
+            # Lines changed - do character-level diff within each line pair
+            for prev_line, curr_line in zip(prev_lines[i1:i2], curr_lines[j1:j2]):
+                highlighted_line = _highlight_char_diff(
+                    prev_line, curr_line, highlight_start)
+                result_parts.append(highlighted_line)
+            # Handle case where curr has more lines than prev in this block
+            extra_curr = curr_lines[j1 + (i2 - i1):j2]
+            for line in extra_curr:
+                result_parts.append(highlight_start + line.rstrip('\n') + ANSI_RESET + '\n' if line.endswith('\n') else highlight_start + line + ANSI_RESET)
+        elif tag == 'insert':
+            # New lines added - highlight entirely
+            for line in curr_lines[j1:j2]:
+                if line.endswith('\n'):
+                    result_parts.append(highlight_start + line.rstrip('\n') + ANSI_RESET + '\n')
+                else:
+                    result_parts.append(highlight_start + line + ANSI_RESET)
+        # tag == 'delete' - lines removed, nothing to output for current
+
+    return ''.join(result_parts)
+
+
+def _highlight_char_diff(prev_line: str, curr_line: str, highlight_start: str) -> str:
+    """Highlight character-level differences within a line.
+
+    Args:
+        prev_line: The previous version of the line.
+        curr_line: The current version of the line.
+        highlight_start: ANSI code to start highlighting.
+
+    Returns:
+        The current line with changed characters highlighted.
+    """
+    import difflib
+
+    # Strip trailing newline for comparison, add back later
+    prev_stripped = prev_line.rstrip('\n')
+    curr_stripped = curr_line.rstrip('\n')
+    had_newline = curr_line.endswith('\n')
+
+    matcher = difflib.SequenceMatcher(None, prev_stripped, curr_stripped)
+    result_chars = []
+    in_highlight = False
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            if in_highlight:
+                result_chars.append(ANSI_RESET)
+                in_highlight = False
+            result_chars.append(curr_stripped[j1:j2])
+        else:  # replace, insert, delete
+            if not in_highlight:
+                result_chars.append(highlight_start)
+                in_highlight = True
+            if tag != 'delete':  # Only append current chars for replace/insert
+                result_chars.append(curr_stripped[j1:j2])
+
+    if in_highlight:
+        result_chars.append(ANSI_RESET)
+
+    result = ''.join(result_chars)
+    if had_newline:
+        result += '\n'
+
+    return result
+
+
+def strip_ansi_codes(s: str) -> str:
+    """Remove ANSI escape codes from a string.
+
+    Args:
+        s: String potentially containing ANSI escape codes.
+
+    Returns:
+        String with all ANSI escape codes removed.
+    """
+    return re.sub(r'\x1b\[[0-9;]*m', '', s)
+
 """
 This info message is printed instead of the arguments when icecream
 fails to find or access source code that's required to parse and analyze.
@@ -414,6 +557,10 @@ class IceCreamDebugger:
         self._logFile: Optional[TextIO] = None
         self._logFilePath: Optional[str] = None
         self._logFileMode: str = 'a'  # 'a' for append, 'w' for overwrite
+        # Diff highlighting state
+        self._enableDiff: bool = False
+        self._diffHighlightStyle: str = 'background'  # 'background', 'foreground', or 'underline'
+        self._previousOutput: Optional[str] = None  # Store previous ic() output for comparison
 
     def __call__(self, *args: object) -> object:
         if self.enabled:
@@ -449,11 +596,24 @@ class IceCreamDebugger:
                 # Keep only the last N entries (O(1) operation with deque)
                 if len(self._lastNBuffer) > self._limitLast:
                     self._lastNBuffer.popleft()
+                # Note: Don't update _previousOutput here - buffered outputs should
+                # only update the diff state when they are actually flushed and displayed.
+                # This ensures diff highlighting shows correct comparisons at flush time.
             elif shouldOutput:
-                self.outputFunction(out)
+                # Apply diff highlighting if enabled
+                displayOut = out
+                if self._enableDiff and self._previousOutput is not None:
+                    displayOut = _compute_diff_highlights(
+                        self._previousOutput, out, self._diffHighlightStyle)
+
+                self.outputFunction(displayOut)
                 self._outputCount += 1
-                # Write to log file if logging is enabled
+                # Write to log file if logging is enabled (use original out without diff highlights)
                 self._writeToLogFile(out)
+
+                # Store current output for next diff comparison
+                if self._enableDiff:
+                    self._previousOutput = out
 
         if not args:  # E.g. ic().
             passthrough = None
@@ -670,6 +830,18 @@ class IceCreamDebugger:
         self._outputCount = 0
         self._lastNBuffer.clear()
 
+    def resetDiff(self) -> None:
+        """Reset the diff comparison state.
+
+        Call this method to clear the stored previous output, so the next
+        ic() call will not be compared to any previous output. This is useful
+        when you want to start a fresh comparison without any highlighting
+        on the next call.
+
+        The enableDiff setting is preserved; only the comparison state is reset.
+        """
+        self._previousOutput = None
+
     def flushCallLimit(self) -> None:
         """Flush the buffered output from limitLast mode.
 
@@ -678,13 +850,27 @@ class IceCreamDebugger:
         (the last N calls). After flushing, the buffer is cleared.
 
         If limitLast is not configured, this method does nothing.
+
+        Note: If enableDiff is True, diff highlighting is applied at flush time,
+        comparing each buffered output to the previous one in the buffer sequence.
         """
         if self._limitLast is not None and self._lastNBuffer:
             for out, indentLevel in self._lastNBuffer:
-                self.outputFunction(out)
+                # Apply diff highlighting if enabled
+                displayOut = out
+                if self._enableDiff and self._previousOutput is not None:
+                    displayOut = _compute_diff_highlights(
+                        self._previousOutput, out, self._diffHighlightStyle)
+
+                self.outputFunction(displayOut)
                 self._outputCount += 1
-                # Write to log file if logging is enabled
+                # Write to log file if logging is enabled (use original out without diff highlights)
                 self._writeToLogFile(out)
+
+                # Update previous output for next comparison in this flush sequence
+                if self._enableDiff:
+                    self._previousOutput = out
+
             self._lastNBuffer.clear()
 
     def configureOutput(
@@ -701,7 +887,9 @@ class IceCreamDebugger:
         limitLast: Union[Optional[int], Literal[Sentinel.absent]] = Sentinel.absent,
         limitEvery: Union[Optional[int], Literal[Sentinel.absent]] = Sentinel.absent,
         logFile: Union[Optional[str], Literal[Sentinel.absent]] = Sentinel.absent,
-        logMode: Union[Literal['a', 'w'], Literal[Sentinel.absent]] = Sentinel.absent
+        logMode: Union[Literal['a', 'w'], Literal[Sentinel.absent]] = Sentinel.absent,
+        enableDiff: Union[bool, Literal[Sentinel.absent]] = Sentinel.absent,
+        diffHighlightStyle: Union[Literal['background', 'foreground', 'underline'], Literal[Sentinel.absent]] = Sentinel.absent
     ) -> None:
         """Configure ic() output settings.
 
@@ -783,6 +971,40 @@ class IceCreamDebugger:
                 multiple runs for comparison. Use 'w' when you want each run
                 to start with a fresh log file.
 
+            enableDiff: If True, highlight differences between consecutive ic()
+                outputs. When enabled, each ic() call compares its output to the
+                previous call and highlights the parts that changed. This makes
+                it much easier to spot what's different when debugging loops or
+                comparing values across multiple ic() calls. Default is False.
+
+                Use case: When debugging a loop with many iterations or tracking
+                state changes, it can be overwhelming to visually scan through
+                all ic() messages to find what changed. With diff highlighting,
+                the changed parts are immediately visible, allowing you to focus
+                on the differences rather than comparing the entire output
+                manually. This is especially useful when only a small portion
+                of a large data structure changes between calls.
+
+                Limitation: Diff comparison is based on the full formatted output
+                string, including context information when includeContext is True.
+                If you change includeContext between calls (e.g., one call with
+                includeContext=False and the next with includeContext=True), the
+                diff will highlight most or all of the output as changed due to
+                the structural difference in the output format, even if the actual
+                values are similar. For best results, keep includeContext consistent
+                across calls when using diff highlighting.
+
+            diffHighlightStyle: Style for highlighting differences when
+                enableDiff is True. Options are:
+                - 'background': Yellow background (most visible, default)
+                - 'foreground': Yellow foreground text (less intrusive)
+                - 'underline': Underlined text (subtle)
+
+                Use case: Choose the style that works best with your terminal
+                and color scheme. 'background' is most visible but may clash
+                with syntax highlighting. 'foreground' is less obtrusive.
+                'underline' is subtle and works well for minor changes.
+
         Note:
             - limitFirst and limitEvery can be combined: output appears for
               calls that satisfy BOTH conditions. For example, limitFirst=50
@@ -850,6 +1072,24 @@ class IceCreamDebugger:
 
             # Disable file logging
             ic.configureOutput(logFile=None)
+
+            # Enable diff highlighting to see changes between consecutive ic() calls
+            ic.configureOutput(enableDiff=True)
+            data = {'count': 0, 'status': 'starting'}
+            ic(data)  # First call - no highlighting (no previous output)
+            data['count'] = 1
+            ic(data)  # Highlights: 'count': 1 (changed from 0)
+            data['status'] = 'running'
+            ic(data)  # Highlights: 'status': 'running' (changed from 'starting')
+
+            # Use less intrusive foreground highlighting
+            ic.configureOutput(diffHighlightStyle='foreground')
+
+            # Reset diff comparison (clear previous output)
+            ic.resetDiff()
+
+            # Disable diff highlighting
+            ic.configureOutput(enableDiff=False)
         """
         noParameterProvided = all(
             v is Sentinel.absent for k, v in locals().items() if k != 'self')
@@ -908,6 +1148,19 @@ class IceCreamDebugger:
                 # Open new log file
                 self._logFilePath = logFile
                 self._logFile = open(logFile, self._logFileMode, encoding='utf-8')
+
+        if enableDiff is not Sentinel.absent:
+            self._enableDiff = enableDiff
+            # Clear previous output when enabling/disabling to start fresh
+            if not enableDiff:
+                self._previousOutput = None
+
+        if diffHighlightStyle is not Sentinel.absent:
+            if diffHighlightStyle not in ('background', 'foreground', 'underline'):
+                raise ValueError(
+                    f"diffHighlightStyle must be 'background', 'foreground', or 'underline', "
+                    f"got {diffHighlightStyle!r}")
+            self._diffHighlightStyle = diffHighlightStyle
 
     def configureSensitiveKeys(
         self,
@@ -1037,6 +1290,16 @@ class IceCreamDebugger:
     def isLogging(self) -> bool:
         """Check if file logging is currently enabled."""
         return self._logFile is not None
+
+    @property
+    def enableDiff(self) -> bool:
+        """Check if diff highlighting is enabled."""
+        return self._enableDiff
+
+    @property
+    def diffHighlightStyle(self) -> str:
+        """Get the current diff highlight style ('background', 'foreground', or 'underline')."""
+        return self._diffHighlightStyle
 
     def _writeToLogFile(self, s: str) -> None:
         """Write output to the log file if logging is enabled.

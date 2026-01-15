@@ -20,7 +20,11 @@ from os.path import basename, splitext, realpath
 
 import icecream
 from icecream import ic, argumentToString, stderrPrint, NO_SOURCE_AVAILABLE_WARNING_MESSAGE
-from icecream.icecream import is_sensitive_key, _mask_sensitive_value
+from icecream.icecream import (
+    is_sensitive_key, _mask_sensitive_value,
+    _compute_diff_highlights, _highlight_char_diff, strip_ansi_codes,
+    ANSI_RESET, ANSI_DIFF_HIGHLIGHT_BG, ANSI_DIFF_HIGHLIGHT_FG, ANSI_DIFF_UNDERLINE
+)
 
 TEST_PAIR_DELIMITER = '| '
 MY_FILENAME = basename(__file__)
@@ -2366,3 +2370,552 @@ class TestFileLogging(unittest.TestCase):
 
         self.assertIn("logMode must be 'a' (append) or 'w' (overwrite)", str(context.exception))
         self.assertIn("'x'", str(context.exception))
+
+
+class TestDiffHighlighting(unittest.TestCase):
+    """Tests for the diff highlighting feature."""
+
+    def setUp(self):
+        ic._pairDelimiter = TEST_PAIR_DELIMITER
+        # Ensure diff is disabled and reset
+        ic.configureOutput(enableDiff=False)
+        ic.resetDiff()
+
+    def tearDown(self):
+        # Reset to default state
+        ic.configureOutput(enableDiff=False)
+        ic.resetDiff()
+
+    def test_diff_disabled_by_default(self):
+        """Diff highlighting should be disabled by default."""
+        self.assertFalse(ic.enableDiff)
+
+    def test_diff_can_be_enabled(self):
+        """Diff highlighting can be enabled via configureOutput."""
+        ic.configureOutput(enableDiff=True)
+        self.assertTrue(ic.enableDiff)
+
+    def test_diff_highlight_style_default(self):
+        """Default diff highlight style should be 'background'."""
+        self.assertEqual(ic.diffHighlightStyle, 'background')
+
+    def test_diff_highlight_style_can_be_changed(self):
+        """Diff highlight style can be changed via configureOutput."""
+        ic.configureOutput(diffHighlightStyle='foreground')
+        self.assertEqual(ic.diffHighlightStyle, 'foreground')
+
+        ic.configureOutput(diffHighlightStyle='underline')
+        self.assertEqual(ic.diffHighlightStyle, 'underline')
+
+        ic.configureOutput(diffHighlightStyle='background')
+        self.assertEqual(ic.diffHighlightStyle, 'background')
+
+    def test_invalid_diff_highlight_style_raises_error(self):
+        """Invalid diffHighlightStyle should raise ValueError."""
+        with self.assertRaises(ValueError) as context:
+            ic.configureOutput(diffHighlightStyle='invalid')
+
+        self.assertIn("diffHighlightStyle must be 'background', 'foreground', or 'underline'",
+                     str(context.exception))
+        self.assertIn("'invalid'", str(context.exception))
+
+    def test_no_highlighting_on_first_call(self):
+        """First ic() call should have no diff highlighting."""
+        ic.configureOutput(enableDiff=True)
+        ic.resetDiff()
+
+        with capture_standard_streams() as (out, err):
+            ic(a)
+
+        output = err.getvalue()
+        # The output should not contain diff ANSI codes (other than syntax highlighting)
+        # Check that there are no yellow background codes specifically
+        self.assertNotIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_highlighting_on_subsequent_calls_with_changes(self):
+        """Subsequent ic() calls should highlight differences."""
+        ic.configureOutput(enableDiff=True)
+        ic.resetDiff()
+
+        with capture_standard_streams() as (out, err):
+            ic(a)  # First call - no highlighting
+            ic(b)  # Second call - should highlight changes
+
+        output = err.getvalue()
+        # The second output should contain diff highlighting ANSI codes
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_no_highlighting_when_output_identical(self):
+        """No highlighting should occur when consecutive outputs are identical."""
+        ic.configureOutput(enableDiff=True)
+        ic.resetDiff()
+
+        same_value = 42
+        with capture_standard_streams() as (out, err):
+            ic(same_value)
+            ic(same_value)  # Same variable, same value
+
+        output = err.getvalue()
+        lines = output.strip().split('\n')
+        # Both lines should be identical (no diff highlights in second line)
+        # The second line should NOT have diff highlighting since nothing changed
+        # Count occurrences of ANSI_DIFF_HIGHLIGHT_BG
+        count = output.count(ANSI_DIFF_HIGHLIGHT_BG)
+        self.assertEqual(count, 0, "No highlighting should occur when outputs are identical")
+
+    def test_highlighting_with_dict_changes(self):
+        """Dict value changes should be highlighted."""
+        ic.configureOutput(enableDiff=True)
+        ic.resetDiff()
+
+        data = {'count': 0, 'status': 'start'}
+
+        with capture_standard_streams() as (out, err):
+            ic(data)
+            data['count'] = 1
+            ic(data)
+
+        output = err.getvalue()
+        # Should have highlighting for the changed value
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_reset_diff_clears_previous_output(self):
+        """resetDiff() should clear previous output for comparison."""
+        ic.configureOutput(enableDiff=True)
+
+        with capture_standard_streams() as (out, err):
+            ic(a)
+            ic.resetDiff()
+            ic(b)  # After reset, this should not be compared to ic(a)
+
+        output = err.getvalue()
+        lines = output.strip().split('\n')
+        # After reset, the ic(b) call should have no highlighting
+        # because there's no previous output to compare to
+        second_line = lines[-1] if len(lines) > 1 else ''
+        # The second call after reset shouldn't have diff highlighting
+        self.assertNotIn(ANSI_DIFF_HIGHLIGHT_BG, second_line)
+
+    def test_disable_diff_clears_previous_output(self):
+        """Disabling diff should clear the previous output."""
+        ic.configureOutput(enableDiff=True)
+
+        with capture_standard_streams() as (out, err):
+            ic(a)
+
+        ic.configureOutput(enableDiff=False)
+        # Previous output should be cleared
+        self.assertIsNone(ic._previousOutput)
+
+    def test_foreground_highlight_style(self):
+        """Foreground highlight style should use foreground ANSI code."""
+        ic.configureOutput(enableDiff=True, diffHighlightStyle='foreground')
+        ic.resetDiff()
+
+        with capture_standard_streams() as (out, err):
+            ic(a)
+            ic(b)
+
+        output = err.getvalue()
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_FG, output)
+        self.assertNotIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_underline_highlight_style(self):
+        """Underline highlight style should use underline ANSI code."""
+        ic.configureOutput(enableDiff=True, diffHighlightStyle='underline')
+        ic.resetDiff()
+
+        with capture_standard_streams() as (out, err):
+            ic(a)
+            ic(b)
+
+        output = err.getvalue()
+        self.assertIn(ANSI_DIFF_UNDERLINE, output)
+        self.assertNotIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_diff_with_multiline_output(self):
+        """Diff highlighting should work with multiline output."""
+        ic.configureOutput(enableDiff=True)
+        ic.resetDiff()
+
+        multiline1 = 'line1\nline2'
+        multiline2 = 'line1\nline3'  # Changed second line
+
+        with capture_standard_streams() as (out, err):
+            ic(multiline1)
+            ic(multiline2)
+
+        output = err.getvalue()
+        # Should have highlighting for the changed line
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_diff_disabled_no_highlighting(self):
+        """When diff is disabled, no highlighting should occur."""
+        ic.configureOutput(enableDiff=False)
+
+        with capture_standard_streams() as (out, err):
+            ic(a)
+            ic(b)
+
+        output = err.getvalue()
+        # No diff highlighting codes should be present
+        self.assertNotIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+        self.assertNotIn(ANSI_DIFF_HIGHLIGHT_FG, output)
+        self.assertNotIn(ANSI_DIFF_UNDERLINE, output)
+
+    def test_diff_with_include_context(self):
+        """Diff highlighting should work with includeContext enabled."""
+        ic.configureOutput(enableDiff=True, includeContext=True)
+        ic.resetDiff()
+
+        with capture_standard_streams() as (out, err):
+            ic(a)
+            ic(b)
+
+        ic.configureOutput(includeContext=False)
+
+        output = err.getvalue()
+        # Should have highlighting for the changed value
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+        # Should also have context info
+        self.assertIn('test_icecream.py:', output)
+
+    def test_diff_with_indentation(self):
+        """Diff highlighting should work with indentation enabled."""
+        ic.configureOutput(enableDiff=True, enableIndentation=True)
+        ic.resetIndentation()
+        ic.resetDiff()
+
+        def inner():
+            with capture_standard_streams() as (out, err):
+                ic(b)
+            return err.getvalue()
+
+        with capture_standard_streams() as (out, err):
+            ic(a)
+
+        result = inner()
+
+        ic.configureOutput(enableIndentation=False)
+
+        # The inner() call should have diff highlighting
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, result)
+
+    def test_diff_properties(self):
+        """Property accessors should reflect current configuration."""
+        ic.configureOutput(enableDiff=True, diffHighlightStyle='foreground')
+
+        self.assertTrue(ic.enableDiff)
+        self.assertEqual(ic.diffHighlightStyle, 'foreground')
+
+        ic.configureOutput(enableDiff=False, diffHighlightStyle='background')
+
+        self.assertFalse(ic.enableDiff)
+        self.assertEqual(ic.diffHighlightStyle, 'background')
+
+
+class TestDiffHelperFunctions(unittest.TestCase):
+    """Tests for the diff helper functions."""
+
+    def test_strip_ansi_codes(self):
+        """strip_ansi_codes should remove all ANSI escape codes."""
+        text_with_ansi = f"{ANSI_DIFF_HIGHLIGHT_BG}highlighted{ANSI_RESET} normal"
+        result = strip_ansi_codes(text_with_ansi)
+        self.assertEqual(result, "highlighted normal")
+
+    def test_strip_ansi_codes_no_ansi(self):
+        """strip_ansi_codes should return unchanged text if no ANSI codes."""
+        plain_text = "just plain text"
+        result = strip_ansi_codes(plain_text)
+        self.assertEqual(result, plain_text)
+
+    def test_compute_diff_highlights_empty_previous(self):
+        """_compute_diff_highlights should return current unchanged if previous is empty."""
+        current = "ic| x: 1"
+        result = _compute_diff_highlights("", current)
+        self.assertEqual(result, current)
+
+    def test_compute_diff_highlights_identical(self):
+        """_compute_diff_highlights should return current unchanged if identical."""
+        text = "ic| x: 1"
+        result = _compute_diff_highlights(text, text)
+        self.assertEqual(result, text)
+
+    def test_compute_diff_highlights_single_char_change(self):
+        """_compute_diff_highlights should highlight single character changes."""
+        prev = "ic| x: 1"
+        curr = "ic| x: 2"
+        result = _compute_diff_highlights(prev, curr, 'background')
+
+        # The '2' should be highlighted
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, result)
+        self.assertIn('2', result)
+        self.assertIn(ANSI_RESET, result)
+
+    def test_compute_diff_highlights_multiple_changes(self):
+        """_compute_diff_highlights should highlight multiple changes."""
+        prev = "ic| a: 1, b: 2"
+        curr = "ic| a: 3, b: 4"
+        result = _compute_diff_highlights(prev, curr, 'background')
+
+        # Both changed values should be highlighted
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, result)
+        self.assertIn('3', result)
+        self.assertIn('4', result)
+
+    def test_compute_diff_highlights_foreground_style(self):
+        """_compute_diff_highlights should use foreground style."""
+        prev = "ic| x: 1"
+        curr = "ic| x: 2"
+        result = _compute_diff_highlights(prev, curr, 'foreground')
+
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_FG, result)
+        self.assertNotIn(ANSI_DIFF_HIGHLIGHT_BG, result)
+
+    def test_compute_diff_highlights_underline_style(self):
+        """_compute_diff_highlights should use underline style."""
+        prev = "ic| x: 1"
+        curr = "ic| x: 2"
+        result = _compute_diff_highlights(prev, curr, 'underline')
+
+        self.assertIn(ANSI_DIFF_UNDERLINE, result)
+        self.assertNotIn(ANSI_DIFF_HIGHLIGHT_BG, result)
+
+    def test_compute_diff_highlights_new_line(self):
+        """_compute_diff_highlights should highlight entirely new lines."""
+        prev = "line1"
+        curr = "line1\nline2"
+        result = _compute_diff_highlights(prev, curr, 'background')
+
+        # The new line should be highlighted
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, result)
+        self.assertIn('line2', result)
+
+    def test_highlight_char_diff_basic(self):
+        """_highlight_char_diff should highlight character differences."""
+        prev = "value: 1"
+        curr = "value: 2"
+        result = _highlight_char_diff(prev, curr, ANSI_DIFF_HIGHLIGHT_BG)
+
+        # Only the '2' should be highlighted
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, result)
+        self.assertIn('2', result)
+        self.assertIn(ANSI_RESET, result)
+        # The unchanged part should not be in a highlight block
+        self.assertTrue(result.startswith('value: '))
+
+    def test_highlight_char_diff_preserves_newline(self):
+        """_highlight_char_diff should preserve trailing newline."""
+        prev = "value: 1\n"
+        curr = "value: 2\n"
+        result = _highlight_char_diff(prev, curr, ANSI_DIFF_HIGHLIGHT_BG)
+
+        self.assertTrue(result.endswith('\n'))
+
+    def test_highlight_char_diff_no_newline(self):
+        """_highlight_char_diff should not add newline if not present."""
+        prev = "value: 1"
+        curr = "value: 2"
+        result = _highlight_char_diff(prev, curr, ANSI_DIFF_HIGHLIGHT_BG)
+
+        self.assertFalse(result.endswith('\n'))
+
+
+class TestDiffWithOtherFeatures(unittest.TestCase):
+    """Tests for diff highlighting interaction with other features."""
+
+    def setUp(self):
+        ic._pairDelimiter = TEST_PAIR_DELIMITER
+        ic.configureOutput(enableDiff=False, limitFirst=None, limitLast=None, limitEvery=None)
+        ic.resetDiff()
+        ic.resetCallLimit()
+
+    def tearDown(self):
+        ic.configureOutput(enableDiff=False, limitFirst=None, limitLast=None, limitEvery=None)
+        ic.resetDiff()
+        ic.resetCallLimit()
+
+    def test_diff_with_limit_first(self):
+        """Diff highlighting should work with limitFirst."""
+        ic.configureOutput(enableDiff=True, limitFirst=3)
+        ic.resetCallLimit()
+        ic.resetDiff()
+
+        with capture_standard_streams() as (out, err):
+            ic(1)  # First call - no highlighting
+            ic(2)  # Second call - with highlighting
+            ic(3)  # Third call - with highlighting
+            ic(4)  # Fourth call - suppressed
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+
+        # Should have 3 outputs
+        self.assertEqual(len(lines), 3)
+        # Should have diff highlighting in some outputs
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_diff_with_limit_every(self):
+        """Diff highlighting should work with limitEvery."""
+        ic.configureOutput(enableDiff=True, limitEvery=2)
+        ic.resetCallLimit()
+        ic.resetDiff()
+
+        with capture_standard_streams() as (out, err):
+            ic(1)  # Call 1 - output
+            ic(2)  # Call 2 - skip
+            ic(3)  # Call 3 - output, compare to call 1
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+
+        # Should have 2 outputs (calls 1 and 3)
+        self.assertEqual(len(lines), 2)
+        # Should have diff highlighting in the second output
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_diff_with_sensitive_masking(self):
+        """Diff highlighting should work with sensitive data masking."""
+        ic.configureSensitiveKeys(keys=['password'])
+        ic.configureOutput(enableDiff=True)
+        ic.resetDiff()
+
+        with capture_standard_streams() as (out, err):
+            ic({'password': 'secret1', 'user': 'alice'})
+            ic({'password': 'secret2', 'user': 'bob'})
+
+        ic.configureSensitiveKeys(clear=True)
+
+        output = err.getvalue()
+        # Password values should be masked
+        self.assertNotIn('secret1', output)
+        self.assertNotIn('secret2', output)
+        self.assertIn('***MASKED***', output)
+        # User change should be highlighted
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_diff_does_not_affect_log_file(self):
+        """Diff highlighting should not appear in log file output."""
+        import os
+
+        ic.configureOutput(enableDiff=True, logFile='test_diff_log.log')
+        ic.resetDiff()
+
+        try:
+            with capture_standard_streams() as (out, err):
+                ic(a)
+                ic(b)
+
+            ic.configureOutput(logFile=None)
+
+            with open('test_diff_log.log', 'r') as f:
+                log_content = f.read()
+
+            # Log file should not contain ANSI codes
+            self.assertNotIn(ANSI_DIFF_HIGHLIGHT_BG, log_content)
+            self.assertNotIn('\x1b[', log_content)
+            # But should contain the actual values
+            self.assertIn('a: 1', log_content)
+            self.assertIn('b: 2', log_content)
+        finally:
+            if os.path.exists('test_diff_log.log'):
+                os.remove('test_diff_log.log')
+
+    def test_diff_with_disabled_ic(self):
+        """Diff should not track outputs when ic is disabled."""
+        ic.configureOutput(enableDiff=True)
+        ic.resetDiff()
+
+        with capture_standard_streams() as (out, err):
+            ic(a)
+
+        # Disable ic and make some calls
+        ic.disable()
+        with capture_standard_streams() as (out, err):
+            ic(b)
+            ic(c)
+
+        # Re-enable ic
+        ic.enable()
+        with capture_standard_streams() as (out, err):
+            ic(a)  # This should compare to the last enabled output (ic(a))
+
+        output = err.getvalue()
+        # Since we're comparing ic(a) to ic(a), there should be no highlighting
+        self.assertNotIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_diff_with_limit_last_correct_comparison(self):
+        """Diff highlighting with limitLast should compare buffered outputs at flush time."""
+        ic.configureOutput(enableDiff=True, limitLast=3)
+        ic.resetCallLimit()
+        ic.resetDiff()
+
+        # Make several ic() calls - only last 3 will be buffered
+        with capture_standard_streams() as (out, err):
+            ic(1)
+            ic(2)
+            ic(3)
+            ic(4)  # Now buffer has [2, 3, 4]
+            ic(5)  # Now buffer has [3, 4, 5]
+
+        # Nothing should be output yet (all buffered)
+        self.assertEqual(err.getvalue(), '')
+
+        # Flush the buffer
+        with capture_standard_streams() as (out, err):
+            ic.flushCallLimit()
+
+        output = err.getvalue()
+        lines = [l for l in output.strip().split('\n') if l.strip()]
+
+        # Should have 3 outputs (3, 4, 5)
+        self.assertEqual(len(lines), 3)
+
+        # First buffered output (3) should have no highlighting (no previous)
+        # Subsequent outputs (4, 5) should have highlighting comparing to previous in buffer
+        # Check that diff highlighting occurs (4 vs 3, and 5 vs 4)
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_diff_with_limit_last_no_premature_tracking(self):
+        """Buffered outputs should not update _previousOutput until flush."""
+        ic.configureOutput(enableDiff=True, limitLast=2)
+        ic.resetCallLimit()
+        ic.resetDiff()
+
+        # First, make a regular output (not buffered)
+        ic.configureOutput(limitLast=None)  # Disable buffering temporarily
+        with capture_standard_streams() as (out, err):
+            ic(a)  # This sets _previousOutput to ic(a)'s output
+
+        # Now enable buffering and make calls
+        ic.configureOutput(limitLast=2)
+        with capture_standard_streams() as (out, err):
+            ic(100)  # Buffered - should NOT update _previousOutput
+            ic(200)  # Buffered - should NOT update _previousOutput
+
+        # Nothing output yet
+        self.assertEqual(err.getvalue(), '')
+
+        # Make another regular call (without buffering)
+        ic.configureOutput(limitLast=None)
+        with capture_standard_streams() as (out, err):
+            ic(a)  # Should compare to the ORIGINAL ic(a), not ic(100) or ic(200)
+
+        output = err.getvalue()
+        # Since we're comparing ic(a) to ic(a), there should be no highlighting
+        # If buffered calls incorrectly updated _previousOutput, this would fail
+        self.assertNotIn(ANSI_DIFF_HIGHLIGHT_BG, output)
+
+    def test_diff_strips_ansi_codes_before_comparison(self):
+        """Diff comparison should strip existing ANSI codes for accurate comparison."""
+        # This tests that strip_ansi_codes is used in _compute_diff_highlights
+        prev_with_ansi = f"\x1b[31mred text\x1b[0m value: 1"
+        curr_with_ansi = f"\x1b[32mgreen text\x1b[0m value: 2"
+
+        result = _compute_diff_highlights(prev_with_ansi, curr_with_ansi, 'background')
+
+        # The result should highlight the actual content differences
+        # not be confused by the different ANSI codes in the input
+        self.assertIn(ANSI_DIFF_HIGHLIGHT_BG, result)
+        # The diff should be based on content: "red" vs "green" and "1" vs "2"
+        self.assertIn('2', result)  # The changed value should be present
